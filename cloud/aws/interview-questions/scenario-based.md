@@ -129,3 +129,146 @@ When failing back: you'll need to sync data from the promoted secondary back to 
 **The real lesson:** Single-region production is a risk decision, not a technical one. The conversation before this incident should have been: "What's our RTO/RPO requirement? What does 2 hours of downtime cost? Is the cost of multi-region DR less than the cost of that downtime?" If the answer was yes, this incident was inevitable. If the answer was no, this is an acceptable incident and the maintenance page is the right response.
 
 **Real scenario:** We had a single-region deployment in `ap-south-1` for a B2B platform. AWS had a control-plane issue in `ap-south-1` that lasted 3 hours. Our EKS control plane was unavailable — pods kept running but we couldn't deploy, scale, or access logs via kubectl. The pods themselves were serving traffic because the data plane was unaffected. We kept serving traffic from the frozen state but couldn't do any deployments. After this, we moved to a multi-region EKS setup with Route53 latency-based routing. The next `ap-south-1` incident lasted 40 minutes — we failed over to `ap-southeast-1` in 8 minutes and users saw only a brief service degradation.
+
+---
+
+## 2. Design a DR strategy with RTO/RPO considerations for a production workload.
+
+This question is about trade-offs. Every DR strategy involves a cost (money + complexity) vs a guarantee (how fast you recover, how much data you lose). The right answer starts with business requirements, not technology choices.
+
+**Define RTO and RPO first — everything flows from these:**
+
+- **RTO (Recovery Time Objective)** — how long the business can tolerate being down. "We need to be back within 30 minutes" is an RTO of 30 minutes
+- **RPO (Recovery Point Objective)** — how much data loss the business can tolerate. "We can lose at most 5 minutes of transactions" is an RPO of 5 minutes
+
+The tighter the RTO/RPO, the more expensive the DR solution. The conversation before any architecture decision should be: "What does 1 hour of downtime cost the business?" If the answer is $50,000, spending $10,000/month on active-active DR is justified. If the answer is $500, a simple backup-and-restore strategy is proportionate.
+
+**The four DR strategies (in order of cost and recovery speed):**
+
+```
+Strategy          | RTO           | RPO       | Cost multiplier
+Backup & Restore  | Hours         | Hours     | 1x (cheapest)
+Pilot Light       | 10–30 min     | Minutes   | 1.5–2x
+Warm Standby      | 2–10 min      | Seconds   | 2–3x
+Active-Active     | Near-zero     | Near-zero | 3–5x (most expensive)
+```
+
+**Strategy 1: Backup & Restore (RTO: 2–4 hours, RPO: 1–24 hours)**
+
+Everything is backed up to S3. When disaster strikes, you provision new infrastructure from Terraform and restore from backup. Lowest cost, highest recovery time.
+
+```hcl
+# RDS automated backups — RPO is determined by backup frequency
+resource "aws_db_instance" "prod" {
+  backup_retention_period = 7          # Keep 7 days of backups
+  backup_window           = "03:00-04:00"  # Daily backup at 3 AM
+  copy_tags_to_snapshot   = true
+}
+
+# Cross-region backup copy for true DR
+resource "aws_db_instance_automated_backups_replication" "cross_region" {
+  source_db_instance_arn = aws_db_instance.prod.arn
+  retention_period       = 7
+}
+```
+
+Terraform stores infrastructure-as-code. In a disaster, `terraform apply` in a new region recreates all infrastructure in ~30 minutes. Restore RDS from the latest snapshot (~20 minutes). Total RTO: ~1 hour.
+
+**Strategy 2: Pilot Light (RTO: 10–30 min, RPO: minutes)**
+
+Core components run in the DR region at minimal scale (1 instance, 1 replica). When disaster strikes, scale up and redirect traffic.
+
+```hcl
+# DR region RDS — read replica (continuous replication)
+resource "aws_db_instance" "dr_replica" {
+  provider                = aws.dr_region   # us-east-1
+  replicate_source_db     = aws_db_instance.prod.arn
+  instance_class          = "db.t3.medium"  # Small instance — just keeping replication alive
+  publicly_accessible     = false
+  skip_final_snapshot     = false
+}
+
+# EKS in DR region — minimal node group (0 or 1 nodes)
+# On activation: scale up node group, promote RDS replica, redirect DNS
+```
+
+Failover procedure:
+1. Promote RDS read replica to primary (~5 minutes)
+2. Scale EKS node group from 1 to desired count (~5 minutes)
+3. Update Route53 to point at DR region ALB (~1 minute + TTL)
+
+**Strategy 3: Warm Standby (RTO: 2–5 min, RPO: seconds)**
+
+DR region runs at reduced but functional capacity. Can serve traffic immediately at reduced scale, then scale up.
+
+```hcl
+# DR region EKS — smaller but running
+eks_managed_node_groups = {
+  dr_general = {
+    instance_types = ["m5.large"]
+    min_size = 2         # Reduced vs prod (prod runs 6)
+    max_size = 10        # Can scale up when needed
+    desired_size = 2
+  }
+}
+
+# Route53 health check — automatic failover
+resource "aws_route53_health_check" "primary" {
+  fqdn              = "api.primary-region.internal"
+  port              = 443
+  type              = "HTTPS"
+  failure_threshold = "3"
+  request_interval  = "10"
+}
+
+resource "aws_route53_record" "api" {
+  set_identifier = "primary"
+  failover_routing_policy {
+    type = "PRIMARY"
+  }
+  health_check_id = aws_route53_health_check.primary.id
+  ...
+}
+
+resource "aws_route53_record" "api_dr" {
+  set_identifier = "secondary"
+  failover_routing_policy {
+    type = "SECONDARY"
+  }
+  ...
+}
+```
+
+When the Route53 health check fails against the primary region, DNS automatically switches to the DR region. No human action required. RTO = Route53 health check failure time + TTL (60–120 seconds total).
+
+**Strategy 4: Active-Active (RTO: near-zero, RPO: near-zero)**
+
+Both regions serve traffic simultaneously. Route53 uses latency-based or weighted routing. Failure of one region: Route53 automatically routes all traffic to the other.
+
+```hcl
+resource "aws_route53_record" "api_ap_south" {
+  latency_routing_policy { region = "ap-south-1" }
+  set_identifier = "ap-south-1"
+  ...
+}
+
+resource "aws_route53_record" "api_us_east" {
+  latency_routing_policy { region = "us-east-1" }
+  set_identifier = "us-east-1"
+  ...
+}
+```
+
+The hard problem in active-active: **database writes from both regions**. You need a globally distributed database: Amazon Aurora Global Database (sub-second replication, < 1 second RPO, < 1 minute RTO for failover) or DynamoDB Global Tables (multi-region active-active writes).
+
+```hcl
+resource "aws_rds_global_cluster" "prod" {
+  global_cluster_identifier = "prod-global-cluster"
+  engine                    = "aurora-postgresql"
+  engine_version            = "15.4"
+}
+```
+
+**What we chose and why:**
+
+For our B2B SaaS, the business case was: 1 hour of downtime costs ~$30K in SLA penalties. We chose Warm Standby (Strategy 3). Cost: ~$3K/month extra for the DR region. ROI: one averted outage per quarter pays for 12 months of DR cost. Active-active was considered and rejected — Aurora Global Database added $4K/month and the architecture complexity (handling write conflicts, dual-region traffic routing) wasn't proportionate for our traffic patterns.

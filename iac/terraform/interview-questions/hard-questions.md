@@ -174,3 +174,341 @@ resource "aws_db_instance" "prod" {
 ```
 
 **Real scenario:** Our Terraform state showed our production RDS was at `postgres 14.9`. AWS automatically upgraded it to `14.12` (minor version auto-upgrade we hadn't disabled). Every `terraform plan` showed: `~ engine_version = "14.9" -> "14.12"`. Engineers were alarmed — "is Terraform about to downgrade our database?" No — but the drift noise was causing alert fatigue. We added `ignore_changes = [engine_version]` and the noise stopped. The key insight: not all drift is a problem. Know which drift you own vs which drift AWS manages.
+
+---
+
+## 3. How do you structure Terraform modules for enterprise-scale projects?
+
+At enterprise scale, the question isn't "how do I write Terraform" — it's "how do I structure it so 20 teams can work independently without breaking each other, and so a new environment can be created in minutes."
+
+**The two anti-patterns we see and fix:**
+
+**Anti-pattern 1: One giant `main.tf` for everything.**
+
+```
+terraform/
+└── main.tf    ← 3,000 lines. Everything in one file. One state file.
+                  One team member's change blocks all others.
+                  `terraform plan` takes 8 minutes.
+                  A destroy here destroys everything.
+```
+
+**Anti-pattern 2: Copy-paste per environment.**
+
+```
+terraform/
+├── prod/main.tf      ← 500 lines
+├── staging/main.tf   ← 498 lines (almost identical, slightly different)
+└── dev/main.tf       ← 502 lines (same, but with a fix that never got merged to prod)
+```
+
+Three copies of the same code diverge immediately. Prod gets a security fix that staging never gets.
+
+**The structure we use:**
+
+```
+terraform/
+├── modules/                          # Reusable building blocks
+│   ├── vpc/
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   ├── outputs.tf
+│   │   └── README.md
+│   ├── eks/
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   └── outputs.tf
+│   ├── rds/
+│   └── microservice/                 # K8s + ECR + IAM for one service
+│       ├── main.tf
+│       ├── variables.tf
+│       └── outputs.tf
+│
+├── environments/                     # Per-environment root modules
+│   ├── dev/
+│   │   ├── main.tf                  # Calls modules with dev vars
+│   │   ├── terraform.tfvars         # Dev-specific values
+│   │   └── backend.tf               # Dev S3 state bucket
+│   ├── staging/
+│   │   ├── main.tf
+│   │   ├── terraform.tfvars
+│   │   └── backend.tf
+│   └── prod/
+│       ├── main.tf
+│       ├── terraform.tfvars
+│       └── backend.tf
+│
+└── services/                        # Per-service infrastructure
+    ├── order-service/
+    │   ├── main.tf                  # Calls the microservice module
+    │   ├── variables.tf
+    │   └── backend.tf
+    └── payment-service/
+        ├── main.tf
+        └── backend.tf
+```
+
+**The `microservice` module — one module for all services:**
+
+```hcl
+# modules/microservice/main.tf
+variable "service_name" { type = string }
+variable "environment"  { type = string }
+variable "image_tag"    { type = string }
+variable "min_replicas" { type = number; default = 2 }
+variable "max_replicas" { type = number; default = 10 }
+
+# ECR repository for this service
+resource "aws_ecr_repository" "service" {
+  name                 = "${var.service_name}-${var.environment}"
+  image_tag_mutability = "IMMUTABLE"
+}
+
+# IAM role for the service (IRSA)
+resource "aws_iam_role" "service" {
+  name = "${var.service_name}-${var.environment}"
+  assume_role_policy = data.aws_iam_policy_document.irsa_trust.json
+}
+
+# Output: what the calling environment needs
+output "ecr_repository_url" { value = aws_ecr_repository.service.repository_url }
+output "service_role_arn"   { value = aws_iam_role.service.arn }
+```
+
+A new service's entire infrastructure is:
+
+```hcl
+# services/new-service/main.tf
+module "new_service" {
+  source = "../../modules/microservice"
+
+  service_name = "inventory-service"
+  environment  = var.environment
+  image_tag    = var.image_tag
+  min_replicas = var.environment == "prod" ? 3 : 1
+}
+```
+
+New service: 10 lines of HCL, gets ECR + IAM + Helm values + everything automatically.
+
+**Separate state per layer — critical for blast radius control:**
+
+```
+State file 1: environments/prod/     ← VPC, EKS, RDS (shared infra)
+State file 2: services/order-service/ ← Order service resources
+State file 3: services/payment-service/ ← Payment service resources
+```
+
+A developer working on the payment service can't accidentally affect the VPC or the order service. Each state file is independent. `terraform destroy` on `services/payment-service` only destroys payment service resources.
+
+**Module versioning — pin in production, float in dev:**
+
+```hcl
+# In production environments — pinned version
+module "eks" {
+  source  = "terraform-aws-modules/eks/aws"
+  version = "= 20.8.4"   # Exact version — no surprises
+}
+
+# In dev environments — allow minor updates
+module "eks" {
+  source  = "terraform-aws-modules/eks/aws"
+  version = "~> 20.0"   # Any 20.x, including patch updates
+}
+```
+
+This prevents a module update from breaking production while allowing dev to test new versions first.
+
+**Real scenario:** We inherited a monorepo Terraform setup where 6 teams shared one state file for an account with 80+ resources. Every `terraform plan` took 9 minutes (refreshing all 80 resources). A junior engineer's mistake in their service's `.tf` block could trigger an unexpected change to the shared RDS instance. We refactored to the layered structure over 6 weeks: separate state per service, separate state for shared infra. `terraform plan` for one service now takes 45 seconds. A mistake in one team's code cannot affect another team's resources.
+
+---
+
+## 4. How do you manage multi-environment (dev/stage/prod) Terraform architecture?
+
+Multi-environment Terraform is the most common architecture challenge. The goal: same code, different configurations, complete isolation between environments.
+
+**The wrong approach — copy-paste directories:**
+
+```
+terraform/dev/main.tf     # Copy 1
+terraform/staging/main.tf  # Copy 2 (already different)
+terraform/prod/main.tf     # Copy 3 (most different — "fixes" that never went back)
+```
+
+By month 3, these are three completely different codebases. A security fix in prod never gets to dev.
+
+**The right approach — shared modules + per-environment variables.**
+
+Same module code, different variable values per environment:
+
+```hcl
+# environments/prod/main.tf
+module "eks" {
+  source = "../../modules/eks"
+
+  cluster_name    = "prod-cluster"
+  instance_types  = ["m5.xlarge"]
+  min_size        = 3
+  max_size        = 10
+  desired_size    = 5
+}
+
+module "rds" {
+  source = "../../modules/rds"
+
+  identifier      = "prod-postgres"
+  instance_class  = "db.r5.xlarge"
+  multi_az        = true          # Prod only
+  deletion_protection = true      # Prod only
+}
+```
+
+```hcl
+# environments/staging/main.tf — same modules, different values
+module "eks" {
+  source = "../../modules/eks"
+
+  cluster_name    = "staging-cluster"
+  instance_types  = ["t3.medium"]   # Cheaper
+  min_size        = 1
+  max_size        = 3
+  desired_size    = 2
+}
+
+module "rds" {
+  source = "../../modules/rds"
+
+  identifier      = "staging-postgres"
+  instance_class  = "db.t3.medium"  # Cheaper
+  multi_az        = false           # Staging doesn't need HA
+  deletion_protection = false
+}
+```
+
+**Separate backends per environment — non-negotiable:**
+
+```hcl
+# environments/prod/backend.tf
+terraform {
+  backend "s3" {
+    bucket         = "my-company-terraform-state-prod"
+    key            = "prod/main/terraform.tfstate"
+    region         = "ap-south-1"
+    dynamodb_table = "terraform-lock-prod"
+    encrypt        = true
+  }
+}
+
+# environments/staging/backend.tf
+terraform {
+  backend "s3" {
+    bucket         = "my-company-terraform-state-staging"
+    key            = "staging/main/terraform.tfstate"
+    region         = "ap-south-1"
+    dynamodb_table = "terraform-lock-staging"
+    encrypt        = true
+  }
+}
+```
+
+Separate state buckets mean a misfire in staging can never corrupt prod state. Separate DynamoDB tables mean staging and prod locks are independent.
+
+**Separate AWS accounts per environment (strongest isolation):**
+
+Beyond separate state files, using separate AWS accounts per environment means:
+- An IAM misconfiguration in dev can't affect prod
+- Dev engineers can have admin access in dev without any prod access
+- Cost Explorer shows exact cost per environment without tagging
+
+```hcl
+# providers.tf — use different AWS profiles per environment
+provider "aws" {
+  region  = var.region
+  profile = "${var.environment}-admin"   # Assumes different named profiles
+  # OR use assume_role for cross-account access from CI
+}
+```
+
+**CI/CD pipeline for Terraform multi-environment:**
+
+```groovy
+// Jenkins pipeline — different stages for different envs
+pipeline {
+  stages {
+    stage('Plan Dev') {
+      steps {
+        dir('environments/dev') {
+          sh 'terraform plan -out=tfplan'
+        }
+      }
+    }
+
+    stage('Apply Dev') {
+      when { branch 'develop' }
+      steps {
+        dir('environments/dev') {
+          sh 'terraform apply tfplan'
+        }
+      }
+    }
+
+    stage('Plan Staging') {
+      steps {
+        dir('environments/staging') {
+          sh 'terraform plan -out=tfplan'
+        }
+      }
+    }
+
+    stage('Apply Staging') {
+      when { branch 'main' }
+      steps {
+        dir('environments/staging') {
+          sh 'terraform apply tfplan'
+        }
+      }
+    }
+
+    stage('Plan Prod') {
+      when { branch 'main' }
+      steps {
+        dir('environments/prod') {
+          sh 'terraform plan -out=tfplan'
+        }
+      }
+    }
+
+    stage('Apply Prod') {
+      when { branch 'main' }
+      input {
+        message "Review the prod plan and approve to apply"
+        ok "Apply to Production"
+      }
+      steps {
+        dir('environments/prod') {
+          sh 'terraform apply tfplan'
+        }
+      }
+    }
+  }
+}
+```
+
+The `input` block is critical — prod applies require a human to review the plan and click Approve in Jenkins. No code path can automatically apply to prod.
+
+**The `count` trick for optional environment features:**
+
+```hcl
+# modules/rds/main.tf
+variable "enable_multi_az" { type = bool; default = false }
+variable "enable_deletion_protection" { type = bool; default = false }
+
+resource "aws_db_instance" "main" {
+  multi_az            = var.enable_multi_az
+  deletion_protection = var.enable_deletion_protection
+}
+```
+
+Prod calls with `enable_multi_az = true`. Dev calls with default `false`. Same module, behavior controlled by variables.
+
+**Real scenario:** A team had `dev/main.tf`, `staging/main.tf`, `prod/main.tf` — three 400-line files. When we audited them, prod had 12 security fixes that never got to dev (dev was running with old insecure defaults). We refactored to the module pattern in a day. Now a security fix to the `rds` module applies to dev, staging, and prod in sequence automatically. Dev and staging are guaranteed to test the exact configuration that hits prod.

@@ -80,6 +80,90 @@ strategy:
 
 ---
 
+## 4. What do you do during Continuous Delivery (CD)?
+
+CD picks up where CI leaves off. CI builds and validates the artifact. CD takes that validated artifact and moves it through environments until it reaches production — automatically or with a controlled gate.
+
+**What CI produces:** A tested, scanned Docker image pushed to ECR tagged with the Git commit SHA. CI stops there.
+
+**What CD does:**
+
+**1. Environment promotion — staging first, then production.**
+
+After CI pushes the image, CD updates the deployment manifests. In our GitOps setup (ArgoCD), Jenkins updates the Helm values file in the manifest repo:
+
+```bash
+# Jenkins runs this after image push:
+yq -i '.image.tag = "abc123def456"' k8s-manifests/apps/order-service/values-staging.yaml
+git commit -m "ci: update order-service to abc123def456 [skip ci]"
+git push
+# ArgoCD detects the change → deploys to staging
+```
+
+**2. Wait for health — not just manifest update.**
+
+A deployment isn't done when the manifest is updated. It's done when the new pods are Running, Ready, and the service is healthy:
+
+```groovy
+sh 'argocd app wait order-service --health --timeout 300'
+# Blocks until ArgoCD reports app as Healthy
+# If pods crash loop, OOMKill, or fail readiness probes → this fails → pipeline fails
+```
+
+**3. Smoke test against the real environment.**
+
+After deployment, hit the actual service endpoint:
+
+```bash
+response=$(curl -s -o /dev/null -w "%{http_code}" https://staging.myapp.com/health)
+if [ "$response" != "200" ]; then
+  echo "Smoke test failed: $response"
+  kubectl rollout undo deployment/order-service -n staging
+  exit 1
+fi
+```
+
+**4. Manual gate before production (Continuous Delivery vs Deployment).**
+
+**Continuous Delivery** — every successful staging deploy is ready for production, but a human explicitly approves the production push. Jenkins `input` step or a PR from staging → main.
+
+**Continuous Deployment** — every successful staging deploy automatically goes to production. No human gate.
+
+We use Continuous Delivery (with a gate) for most services. The gate is a 1-click approval in Jenkins after staging smoke tests pass. This gives the team 30 minutes to look at staging before prod gets the change.
+
+```groovy
+stage('Approve Prod') {
+  steps {
+    timeout(time: 30, unit: 'MINUTES') {
+      input message: 'Deploy to production?', ok: 'Deploy'
+    }
+  }
+}
+stage('Deploy Prod') {
+  steps {
+    sh 'yq -i \'.image.tag = "$IMAGE_TAG"\' k8s-manifests/apps/order-service/values-prod.yaml'
+    sh 'git push'  // ArgoCD syncs to prod
+  }
+}
+```
+
+**5. Post-production verification.**
+
+```bash
+# Watch key metrics for 10 minutes after prod deploy
+# Error rate (Grafana)
+# Latency p99 (Grafana)
+# Business metrics (orders placed, checkout completions)
+# If anything degrades: rollback
+kubectl rollout undo deployment/order-service -n prod
+```
+
+**The key difference between CI and CD:**
+
+CI proves the code works. CD proves the code works *in each environment* with real config, real dependencies, and real traffic. A service can pass all CI checks and still fail in production because of a missing secret, a NetworkPolicy that doesn't allow a new dependency, or a database schema that wasn't migrated. CD is about safely getting the artifact to where it runs.
+
+---
+
 ## 3. How does a Canary Deployment work?
 
 A canary deployment sends a small percentage of traffic to the new version and gradually increases it while monitoring metrics. If something goes wrong, you abort and all traffic goes back to the stable version — only a fraction of users were affected.

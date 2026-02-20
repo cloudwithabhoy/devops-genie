@@ -2,86 +2,7 @@
 
 ---
 
-## 1. Jenkins pipeline runs but the build does not trigger — what could be the reasons?
-
-"Pipeline runs" means Jenkins executed something, but the actual build step — compiling, testing, building the image — never started. This is different from a build that fails. Here's how I debug it systematically.
-
-**1. Webhook delivered but Jenkins didn't match the branch.**
-
-The most common cause. The webhook fires, Jenkins receives it, but the Multibranch Pipeline doesn't see a matching branch to build.
-
-Check: Jenkins → Pipeline job → Scan Multibranch Pipeline Log. It shows which branches were discovered and why some were skipped.
-
-Common causes:
-- Branch filter regex doesn't match your branch name (`feature/my-feature` vs expected `feature-my-feature`)
-- The Jenkinsfile doesn't exist on that branch (Jenkins scans for it, can't find it, skips the branch)
-- Branch was just created and the scan hasn't run yet — trigger a manual scan or reduce the scan interval
-
-**2. Webhook not reaching Jenkins.**
-
-GitHub shows the webhook as "delivered" with a green tick, but Jenkins never received it.
-
-Check GitHub: Repo → Settings → Webhooks → Recent Deliveries. Look at the response code. If it's `302`, `401`, `500`, Jenkins received it but rejected or errored. If there's no delivery at all, the URL is wrong or Jenkins is unreachable.
-
-We had this after rotating a Jenkins reverse proxy SSL cert. GitHub started getting SSL errors on the webhook endpoint. The webhook showed "failed" in GitHub delivery logs. Fix: updated the cert, re-tested the webhook delivery manually.
-
-**3. Jenkins CSRF protection blocking the webhook.**
-
-Jenkins has CSRF protection that can reject POST requests from GitHub. The fix is to configure the GitHub plugin properly or add an exception.
-
-Check: Jenkins → Manage Jenkins → Security → CSRF Protection. If "Crumb Issuer" is on, webhooks need to include a crumb token. The GitHub plugin handles this automatically if configured correctly — but a misconfigured plugin causes silently dropped webhooks.
-
-**4. Pipeline was triggered but skipped due to `when {}` condition.**
-
-```groovy
-stage('Deploy to Prod') {
-  when {
-    branch 'main'
-  }
-  steps { ... }
-}
-```
-
-The pipeline ran, but the stage was skipped because the `when` condition evaluated to false. The build shows as "Success" but nothing deployed. This is correct behavior — but it looks like the build "didn't trigger" from the outside.
-
-Check the build log — skipped stages show as light grey in Blue Ocean or have "Stage skipped due to when condition" in the console output.
-
-**5. Build throttling or executor starvation.**
-
-Jenkins has a limited number of executors. If all executors are busy, new builds queue but don't start. From the outside, it looks like the build isn't triggering.
-
-Check: Jenkins home page → Build Queue. If builds are stacking up, you need more executors or more agents.
-
-We had a night where a scheduled nightly job consumed all 4 agents, and 12 PR builds queued for 2 hours without starting. Fix: added dedicated agents for PR builds and reserved the nightly job to a specific agent label.
-
-**6. `skipDefaultCheckout` or pipeline agent misconfiguration.**
-
-```groovy
-pipeline {
-  agent none    // No global agent
-  stages {
-    stage('Build') {
-      // No agent defined here either — this stage has nowhere to run
-      steps {
-        sh 'docker build .'
-      }
-    }
-  }
-}
-```
-
-If `agent none` is set at the pipeline level and a stage doesn't have its own `agent` block, that stage silently does nothing.
-
-**My debug checklist:**
-1. GitHub webhook delivery log — was it delivered? What was the response?
-2. Jenkins Multibranch scan log — was the branch discovered?
-3. Build queue — is the build queued and waiting for an executor?
-4. Build console log — did it run and skip via `when {}` condition?
-5. Agent availability — are there idle agents with the right labels?
-
----
-
-## 2. A critical bug is found in production — what is your approach?
+## 1. A critical bug is found in production — what is your approach?
 
 The wrong answer: "I create a hotfix branch and deploy it." That's a step, not an approach.
 
@@ -147,7 +68,7 @@ Not a blame session. Questions:
 
 ---
 
-## 3. A deployment succeeded but users get 502 errors — what do you check first, and in what order?
+## 2. A deployment succeeded but users get 502 errors — what do you check first, and in what order?
 
 502 means the gateway received an invalid or no response from the upstream. The deployment succeeded — K8s is happy, ArgoCD shows synced — but users aren't.
 
@@ -223,7 +144,7 @@ kubectl describe pod <new-pod> -n prod | grep OOM  # Memory kills?
 
 ---
 
-## 4. A service works in staging but fails in production — how do you narrow the difference without guessing?
+## 3. A service works in staging but fails in production — how do you narrow the difference without guessing?
 
 The answer is systematic diffing, not intuition. "It worked in staging" tells you the code is probably fine — the difference is in the environment.
 
@@ -290,7 +211,7 @@ Events tell you what Kubernetes is complaining about — failed mounts, image pu
 
 ---
 
-## 5. A rollout caused a partial outage — how do you decide between rollback, roll-forward, or hotfix?
+## 4. A rollout caused a partial outage — how do you decide between rollback, roll-forward, or hotfix?
 
 Three options, different use cases. The wrong answer is picking one without reasoning about the situation.
 
@@ -365,3 +286,392 @@ Post in the incident channel within the first 2 minutes:
 > "Partial outage on [service] since [time]. Caused by deployment [version]. Rollback in progress. Next update in 10 minutes."
 
 Don't speculate on root cause until you know. Don't go silent. The worst outcome isn't picking the wrong option — it's 5 engineers silently debugging while stakeholders are in the dark.
+
+---
+
+## 5. CI/CD pipeline succeeded, but the deployment failed in production — how do you handle it?
+
+"Pipeline succeeded" means CI passed — tests, scan, build, image push all green. "Deployment failed" means the application isn't actually running correctly in production. These are two different things, and confusing them is dangerous.
+
+**First: understand what "deployment failed" actually means.**
+
+The pipeline's last step is usually updating the image tag in the manifest repo (for GitOps) or running `kubectl apply` / `helm upgrade`. "Succeeded" in the pipeline could mean the manifest was updated — but ArgoCD hasn't synced yet, or the rollout failed after the pipeline finished.
+
+```bash
+# Check what ArgoCD actually did with the manifest update
+argocd app get order-service --grpc-web
+# Status: Degraded? OutOfSync? Progressing?
+
+# Check the actual rollout status in the cluster
+kubectl rollout status deployment/order-service -n prod
+# Waiting for deployment — this is where real failures appear
+
+# Check pod status
+kubectl get pods -n prod -l app=order-service
+# CrashLoopBackOff / OOMKilled / ErrImagePull — tells you why
+```
+
+**Common reasons the pipeline passes but production breaks:**
+
+**1. Smoke test not in the pipeline (most common).**
+
+The pipeline marks the build successful after pushing to ECR and updating the manifest. But nobody checks if the new pods actually started correctly. A smoke test should be the final pipeline stage:
+
+```groovy
+stage('Verify Deployment') {
+  steps {
+    script {
+      // Wait for rollout to complete
+      sh 'kubectl rollout status deployment/order-service -n prod --timeout=5m'
+
+      // Hit the health endpoint of the new pods
+      def response = sh(
+        script: 'curl -s -o /dev/null -w "%{http_code}" https://api.prod.com/health',
+        returnStdout: true
+      ).trim()
+
+      if (response != '200') {
+        error("Smoke test failed: health endpoint returned ${response}")
+        // Trigger rollback automatically
+        sh 'kubectl rollout undo deployment/order-service -n prod'
+      }
+    }
+  }
+}
+```
+
+**2. GitOps lag — pipeline finished before ArgoCD synced.**
+
+In a GitOps setup (ArgoCD), the pipeline updates the manifest repo and exits. ArgoCD polls the repo every 3 minutes and then applies. The pipeline is done 3 minutes before the actual deployment even starts.
+
+```groovy
+stage('Wait for ArgoCD sync') {
+  steps {
+    sh '''
+      argocd app wait order-service \
+        --grpc-web \
+        --server argocd.internal.company.com \
+        --timeout 300 \
+        --health
+    '''
+    // argocd app wait blocks until the app is Healthy or times out
+  }
+}
+```
+
+`argocd app wait --health` blocks the pipeline stage until ArgoCD reports the app as `Healthy`. If the new pods crash loop, ArgoCD reports `Degraded`, `argocd app wait` fails, and the pipeline marks the stage failed.
+
+**3. Readiness probe failure — pods run but never become Ready.**
+
+The deployment shows `Running` in the pod list but the rollout doesn't complete. New pods aren't passing readiness probes, so the Service doesn't route traffic to them, and the rolling update stalls with old pods still running.
+
+```bash
+kubectl describe pod <new-pod> -n prod | grep -A 20 "Events:"
+# "Readiness probe failed: HTTP probe failed with statuscode: 404"
+# → Health endpoint path changed in new version
+# "Readiness probe failed: dial tcp: connection refused"
+# → App not listening on the expected port
+```
+
+**4. OOMKilled — new version has higher memory usage.**
+
+New pod starts, passes readiness probe, gets traffic, handles a few requests with increased memory usage, hits limit, OOMKilled, restarts. The pipeline sees the rollout complete (pods reached Ready once), marks success. But pods are in a restart loop.
+
+```bash
+kubectl describe pod <pod> -n prod | grep OOM
+# "Last State: Terminated Reason: OOMKilled"
+```
+
+**Rollback procedure when you catch post-pipeline failure:**
+
+```bash
+# Immediate rollback via kubectl
+kubectl rollout undo deployment/order-service -n prod
+
+# In GitOps — revert the manifest commit so ArgoCD re-syncs to old state
+git revert <manifest-commit-sha>
+git push    # ArgoCD picks up the revert and rolls back
+
+# Verify rollback completed
+kubectl rollout status deployment/order-service -n prod
+kubectl get endpoints order-service -n prod   # Should show healthy backends
+```
+
+**What we added after our first "pipeline succeeded, prod broken" incident:**
+
+1. `argocd app wait` in the final pipeline stage — pipeline only succeeds when ArgoCD confirms healthy
+2. Smoke test hitting the real production endpoint post-deploy
+3. Automatic rollback triggered if smoke test fails
+4. PagerDuty alert if rollout takes > 10 minutes (rolling updates should complete in < 3 minutes)
+
+The pipeline went from "build + push + manifest update" to "build + push + manifest update + wait for healthy + smoke test." Added 3 minutes to pipeline time. Caught 3 production failures automatically in the first month — none reached users.
+
+---
+
+## 6. Your build pipeline failed at the deployment stage — how would you debug it?
+
+The deployment stage is the last stage — by this point, build, test, and image push have all passed. Failure here is narrower than a general pipeline failure, but it still has several distinct root causes.
+
+**Step 1 — Read the exact error message before doing anything else.**
+
+```bash
+# For Jenkins — Console Output
+# For GitHub Actions — failed step's output in the Actions tab
+# For GitLab CI — job log
+
+# Common deployment stage errors and what they mean:
+# "Error from server (Forbidden): deployments is forbidden"
+#    → CI service account doesn't have RBAC permission to create/update Deployments
+
+# "ImagePullBackOff" after kubectl apply
+#    → Image tag doesn't exist in registry, or registry auth failed
+
+# "error: unable to recognize 'manifests/deploy.yaml': no matches for kind"
+#    → Kubernetes API version mismatch — manifest uses deprecated/removed API
+
+# "argocd app wait: timed out waiting for app to become healthy"
+#    → Deployment in cluster is failing (pods not ready) — separate from pipeline
+
+# "helm upgrade failed: another operation is in progress"
+#    → Concurrent Helm release lock (from a stuck previous run)
+```
+
+**Step 2 — Identify which layer failed.**
+
+```
+CI pipeline layer:  kubectl/helm command returned non-zero exit code
+                    → Check the exact command output in the pipeline log
+
+Cluster layer:      kubectl returned success but deployment is degraded
+                    → Check ArgoCD app status / kubectl rollout status
+
+Application layer:  Pods start but crash or fail readiness probes
+                    → kubectl describe pod, kubectl logs
+```
+
+**Step 3 — Debug the most common causes.**
+
+**RBAC / permission error:**
+
+```bash
+# Reproduce locally — run the exact same kubectl/helm command
+# with the CI service account's kubeconfig
+kubectl auth can-i create deployments \
+  --as=system:serviceaccount:ci:jenkins-sa -n prod
+# "no" → missing ClusterRole or RoleBinding
+
+# Fix: check the CI service account's RBAC
+kubectl get rolebinding -n prod | grep jenkins
+kubectl describe clusterrolebinding jenkins-deploy
+```
+
+**Image doesn't exist in registry:**
+
+```bash
+# Check the pipeline — did the push stage succeed?
+# Did the image tag in the manifest match what was pushed?
+
+# Often the bug: pipeline uses $GIT_COMMIT but manifest update used wrong variable
+grep "image:" k8s-manifests/apps/order-service/values-prod.yaml
+# image.tag: ""  ← empty — variable substitution silently failed
+
+# Test image pull manually
+docker pull 123456789.dkr.ecr.ap-south-1.amazonaws.com/order-service:abc123
+# Or from inside the cluster:
+kubectl run test --image=123456789.dkr.ecr.ap-south-1.amazonaws.com/order-service:abc123 \
+  --restart=Never -n prod
+kubectl describe pod test -n prod | grep -A5 Events
+```
+
+**Helm lock stuck (concurrent release):**
+
+```bash
+helm list -n prod | grep order-service
+# STATUS: pending-upgrade  ← previous Helm operation didn't complete
+
+# Release the lock
+helm rollback order-service 0 -n prod   # 0 = previous release
+# OR
+kubectl delete secret -n prod -l "status=pending-upgrade,name=order-service"
+```
+
+**Kubernetes API version removed:**
+
+```bash
+# Check what API versions the cluster supports
+kubectl api-versions | grep apps
+
+# Manifest uses apps/v1beta1 but cluster is K8s 1.25+ (removed it)
+kubectl explain deployment --api-version=apps/v1
+# Use apps/v1 instead
+```
+
+**Step 4 — Check cluster-side events, not just pipeline logs.**
+
+A deployment stage can fail because the pipeline command succeeded but the cluster rejected the result:
+
+```bash
+kubectl get events -n prod --sort-by=.lastTimestamp | tail -20
+# "FailedCreate: Error creating: pods 'order-service-xxxx' is forbidden:
+#  exceeded quota: pods, requested: pods=1, used: pods=10, limited: pods=10"
+# → ResourceQuota in the namespace is exhausted — no quota for new pod
+
+kubectl describe resourcequota -n prod
+```
+
+**Step 5 — Reproduce outside the pipeline.**
+
+If the error is hard to read in CI output, run the deployment command manually from your machine using the same credentials:
+
+```bash
+# Extract what the pipeline runs
+kubectl apply -f manifests/ --dry-run=server
+helm upgrade --install order-service ./charts/order-service \
+  -f values-prod.yaml --dry-run
+```
+
+`--dry-run=server` sends the manifest to the API server for validation without applying it. It catches API version issues, schema validation errors, and RBAC problems — without touching the live deployment.
+
+**Real scenario:** A deployment stage started failing after a Kubernetes upgrade from 1.24 to 1.25. The pipeline error was cryptic: `no matches for kind "PodSecurityPolicy" in version "policy/v1beta1"`. PodSecurityPolicy was removed in 1.25. Our Helm chart had a PSP template. The fix was to remove the PSP template and replace it with Pod Security Admission labels on the namespace. The pipeline error came from `helm upgrade` failing validation. Reproducing it with `helm upgrade --dry-run` locally made the error readable immediately.
+
+---
+
+## 7. What's your approach to handle failures in automated test or build stages?
+
+Test and build failures are where pipelines spend most of their failing time. The question is: how do you make failures actionable — not just "the pipeline is red."
+
+**Principle: fail fast, fail clearly.**
+
+The goal is that a developer who gets a failed pipeline notification can understand what broke and why within 30 seconds, without opening the full log.
+
+**For test failures:**
+
+```groovy
+// JUnit result publishing — turns test failures into structured reports
+// Jenkins: failures show as individual test cases in the UI, not buried in log
+stage('Test') {
+  steps {
+    sh 'pytest tests/ --junitxml=test-results/results.xml -v'
+  }
+  post {
+    always {
+      junit 'test-results/results.xml'
+      // Failed tests appear in "Test Results" tab with:
+      // - Which test failed
+      // - What was expected vs actual
+      // - Full traceback
+    }
+    failure {
+      // Attach the test report to the Slack notification
+      slackSend channel: '#ci-alerts',
+        message: "Tests failed in ${env.JOB_NAME} — ${env.BUILD_URL}testReport"
+    }
+  }
+}
+```
+
+For GitHub Actions, publish test results with a summary in the PR:
+
+```yaml
+- name: Publish test results
+  uses: EnricoMi/publish-unit-test-result-action@v2
+  if: always()   # Run even if tests failed
+  with:
+    files: test-results/*.xml
+# Creates a check on the PR that shows which tests failed
+```
+
+**For flaky tests — the silent killer of CI reliability:**
+
+A flaky test fails intermittently — passes 80% of runs, fails 20% with no code change. This destroys trust in the pipeline. Engineers start re-running builds and ignoring failures.
+
+```groovy
+// Retry flaky tests before failing the build — but track flakiness
+stage('Test') {
+  steps {
+    retry(2) {
+      sh 'pytest tests/ --junitxml=results.xml'
+    }
+  }
+}
+// If a test passes on retry — it's flaky. Track it.
+// We use a Slack alert when retries occur: "Tests passed after retry — possible flakiness in test X"
+```
+
+Better: use pytest-rerunfailures to retry at the individual test level:
+
+```bash
+pytest tests/ --reruns 2 --reruns-delay 1 --junitxml=results.xml
+# Retries each failing test 2 times before marking it as failed
+# Flaky tests that pass on retry are marked in the JUnit XML for tracking
+```
+
+We maintain a "flaky test register" — tests that fail more than 3 times in 30 days without a code change are quarantined (moved to a separate non-blocking test suite) until fixed. This keeps the main pipeline trustworthy.
+
+**For build failures (Docker build, compilation, dependency install):**
+
+```bash
+# Make build errors immediately visible
+docker build --progress=plain -t my-app:$GIT_COMMIT .
+# --progress=plain shows each layer's output — you see which step failed and why
+# Without this: Docker's default output hides the failing command's error
+```
+
+For dependency failures:
+
+```bash
+# Cache dependencies to avoid slow reinstalls — but also cache the error
+# If pip install fails: is it a new transitive dependency that broke?
+pip install -r requirements.txt --verbose 2>&1 | tail -50
+# See the actual package installation error, not just "exit code 1"
+```
+
+**Notification strategy — alert the right person, not everyone:**
+
+```groovy
+post {
+  failure {
+    // Notify the person who triggered the build — not the whole channel
+    emailext (
+      to: "${env.BUILD_USER_EMAIL}",
+      subject: "Build failed: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+      body: """
+        Stage: ${env.FAILED_STAGE}
+        Branch: ${env.BRANCH_NAME}
+        Commit: ${env.GIT_COMMIT}
+        Log: ${env.BUILD_URL}console
+      """
+    )
+    // Notify the team channel only for main/production pipelines
+    script {
+      if (env.BRANCH_NAME == 'main') {
+        slackSend channel: '#deployments', color: 'danger',
+          message: "MAIN branch build failed: ${env.JOB_NAME} | ${env.BUILD_URL}"
+      }
+    }
+  }
+}
+```
+
+**Blocking vs non-blocking failures:**
+
+Not all failures should block the pipeline:
+
+```groovy
+stage('SAST') {
+  steps {
+    // Critical CVEs: block the build
+    sh 'trivy image --exit-code 1 --severity CRITICAL --ignore-unfixed $IMAGE'
+  }
+}
+stage('Code Coverage') {
+  steps {
+    // Coverage report: informational, don't block for low coverage on old code
+    sh 'pytest --cov=app --cov-report=xml || true'  // Never fails the build
+    // Separately: fail if coverage drops below threshold on new code only
+    sh 'coverage report --fail-under=80 --include="app/new_feature*"'
+  }
+}
+```
+
+**Real scenario:** Our pipeline had an integration test that called a real third-party API (SMS provider). It worked 95% of the time. The 5% failures were API timeouts — not our code. Engineers were re-running builds daily. We moved that test to a separate nightly pipeline (not on every PR), replaced it with a mocked version for the PR pipeline, and added a weekly report of nightly flakiness. PR pipeline reliability went from 93% to 99.4%. Engineers stopped ignoring red builds.

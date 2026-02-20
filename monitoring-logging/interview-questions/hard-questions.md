@@ -296,3 +296,355 @@ spec:
 VPA watches actual CPU and memory usage over time and recommends resource requests/limits. We review recommendations monthly and apply them manually. This prevents pods from being over-provisioned (wasting money) or under-provisioned (getting OOMKilled or throttled).
 
 **Real scenario:** We had an HPA configured on CPU for our PDF generation service. PDF generation is CPU-intensive but each job takes 30 seconds. A burst of 50 PDF requests triggered HPA scale-out. New pods spun up in 90 seconds — by then, the burst was handled by the original pods (barely). The new pods sat idle for 10 minutes, then HPA scaled back in. The autoscaling added no benefit and cost $12 in unnecessary pod-minutes. We replaced HPA with a static `replicas: 5` (based on VPA recommendations for peak load) and a queue-depth-based HPA using the SQS queue length as the metric. Now scale-out happens based on actual queue depth, not lagging CPU metrics.
+
+---
+
+## 4. How do you define SLI, SLO, and SLA in production, and how do you calculate error budget?
+
+SLI/SLO/SLA is the reliability engineering framework that turns "the system should be reliable" into a measurable, actionable target.
+
+**SLI (Service Level Indicator) — the actual measurement.**
+
+An SLI is a metric that measures one aspect of service quality. The most useful SLIs follow the RED method:
+
+- **Request rate** — how many requests per second
+- **Error rate** — what fraction of requests fail
+- **Duration** — how long requests take (latency)
+
+```promql
+# SLI: proportion of successful HTTP requests (success rate)
+sum(rate(http_requests_total{service="checkout", status!~"5.."}[5m]))
+/
+sum(rate(http_requests_total{service="checkout"}[5m]))
+
+# SLI: proportion of requests completing within 500ms
+sum(rate(http_request_duration_seconds_bucket{service="checkout", le="0.5"}[5m]))
+/
+sum(rate(http_request_duration_seconds_count{service="checkout"}[5m]))
+```
+
+Good SLIs are: user-facing (measures what users experience), measurable (not "team feels good"), proportional (fraction, not absolute count).
+
+**SLO (Service Level Objective) — the target.**
+
+An SLO is the target value for an SLI, measured over a time window. It's the internal commitment the engineering team makes.
+
+```
+SLO: checkout service success rate ≥ 99.9% over a rolling 30-day window
+SLO: 95% of checkout requests complete within 500ms over a rolling 30-day window
+```
+
+The SLO is your internal bar. It should be set below 100% — targeting 100% availability means every incident is a breach, and the team burns out constantly firefighting.
+
+**SLA (Service Level Agreement) — the external promise.**
+
+An SLA is a contract with customers. It's usually set lower than the SLO to give engineering headroom:
+
+```
+SLA: 99.5% availability per month (if breached, customers get credits)
+SLO: 99.9% availability (internal target — gives 4x headroom above SLA)
+```
+
+If your SLO is 99.9% and your SLA is 99.5%, you have a 0.4% buffer. Even if you miss your SLO by a little, you don't breach the customer SLA.
+
+**Error budget — the math:**
+
+Error budget = the amount of downtime/errors allowed before the SLO is breached.
+
+```
+SLO: 99.9% success rate over 30 days
+Total requests in 30 days: 10,000,000
+
+Allowed failures = 10,000,000 × (1 - 0.999) = 10,000 failures
+
+If you've had 7,000 failures so far this month → 3,000 failures remaining in the budget
+```
+
+For availability:
+
+```
+SLO: 99.9% uptime over 30 days
+Total minutes in 30 days: 30 × 24 × 60 = 43,200 minutes
+
+Error budget = 43,200 × (1 - 0.999) = 43.2 minutes of downtime allowed per month
+```
+
+99.9% SLO = ~43 minutes of downtime per month. 99.99% SLO = ~4.3 minutes per month. 100% SLO = zero tolerance for any downtime — not realistic.
+
+**How we track error budget in Prometheus:**
+
+```promql
+# Remaining error budget as a percentage
+(
+  sum(rate(http_requests_total{service="checkout", status!~"5.."}[30d]))
+  /
+  sum(rate(http_requests_total{service="checkout"}[30d]))
+  - 0.999    # SLO threshold
+)
+/ (1 - 0.999)   # Maximum allowed error rate
+* 100
+```
+
+If this returns 60%, you have 60% of your error budget remaining for the month.
+
+**Error budget policies — what to do with the budget:**
+
+```
+Error budget remaining > 50%:  Normal velocity. Ship features, take risks.
+Error budget remaining 25–50%: Caution. Risky deployments need extra review.
+Error budget remaining 0–25%:  Feature freeze. Focus on reliability work.
+Error budget exhausted (0%):   Hard feature freeze. All hands on reliability.
+                                No new deployments until budget resets.
+```
+
+This is the key SRE insight: error budget converts "reliability vs velocity" from a negotiation into math. When budget is healthy, engineering can deploy frequently. When budget is low, the numbers justify slowing down — no argument needed with product.
+
+**Real scenario:** Our payment service had an SLO of 99.95%. In month 3, two incidents consumed 80% of the error budget by day 15. Under the error budget policy, we declared a feature freeze for the payment team for the remaining 15 days. The team did only reliability work: fixed root causes, added runbooks, improved alerting. The month ended with 0 additional incidents. Following month: full budget available, team resumed normal feature velocity. The budget policy made the decision objective — not a manager overruling an engineer, but a shared metric.
+
+---
+
+## 5. How do you design monitoring and alerting for a microservices platform?
+
+The wrong approach: add a Prometheus alert for every metric you have. The result: hundreds of alerts, 90% of which are noise. Engineers start ignoring pages. The right approach: alert on symptoms, not causes, and design for actionability.
+
+**The monitoring stack we use:**
+
+```
+Metrics:  Prometheus (scrape) → Thanos (long-term storage, HA) → Grafana (dashboards)
+Logs:     Fluent Bit (collect) → Loki → Grafana (query)
+Traces:   OpenTelemetry SDK → Tempo → Grafana (trace view)
+Alerts:   Alertmanager → PagerDuty (Sev-1/2) → Slack (Sev-3/4)
+```
+
+**What to instrument in each service:**
+
+Every service exposes a `/metrics` endpoint with these RED metrics:
+
+```python
+# Python — using prometheus_client
+from prometheus_client import Counter, Histogram
+
+REQUEST_COUNT = Counter(
+    'http_requests_total',
+    'Total HTTP requests',
+    ['method', 'endpoint', 'status_code', 'service']
+)
+
+REQUEST_DURATION = Histogram(
+    'http_request_duration_seconds',
+    'HTTP request duration',
+    ['method', 'endpoint', 'service'],
+    buckets=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5]
+)
+```
+
+Every service has a standard Grafana dashboard (generated from a template):
+- Request rate (req/s)
+- Error rate (%)
+- p50, p95, p99 latency
+- Pod count and restarts
+- CPU and memory usage
+
+**Alerting philosophy — symptoms over causes:**
+
+```
+Wrong alert: "CPU is above 70%"
+  → Fires constantly, CPU high isn't always a user problem
+
+Right alert: "Error rate is above 1% for 5 minutes"
+  → Always means users are experiencing failures
+
+Wrong alert: "Pod restart count increased"
+  → A single restart might be normal (OOMKill on low-traffic pod)
+
+Right alert: "Pod is restarting more than 5 times in 10 minutes"
+  → Users are definitely affected (CrashLoopBackOff)
+```
+
+**Our alert tiers:**
+
+```yaml
+# Sev-1: Pages on-call immediately (PagerDuty)
+- alert: ServiceDown
+  expr: sum(up{job="order-service"}) == 0
+  for: 1m
+  labels:
+    severity: critical
+
+- alert: HighErrorRate
+  expr: |
+    sum(rate(http_requests_total{status=~"5.."}[5m]))
+    / sum(rate(http_requests_total[5m])) > 0.05
+  for: 5m
+  labels:
+    severity: critical
+
+# Sev-2: Pages on-call, can wait until acknowledged (< 30 min)
+- alert: ElevatedErrorRate
+  expr: |
+    sum(rate(http_requests_total{status=~"5.."}[5m]))
+    / sum(rate(http_requests_total[5m])) > 0.01
+  for: 10m
+  labels:
+    severity: warning
+
+- alert: HighLatency
+  expr: |
+    histogram_quantile(0.99,
+      rate(http_request_duration_seconds_bucket[5m])
+    ) > 2
+  for: 10m
+  labels:
+    severity: warning
+
+# Sev-3: Slack notification, no page
+- alert: ErrorBudgetBurning
+  expr: error_budget_remaining < 0.25
+  labels:
+    severity: info
+```
+
+**Multi-window, multi-burn-rate alerts (Google SRE book approach):**
+
+Standard alerts have a lag — error rate must be elevated for `for: 5m` before alerting. If your error budget burns fast (a critical outage), you want to alert faster. Multi-burn-rate alerts detect both fast burns and slow burns:
+
+```yaml
+# Fast burn: 14x normal burn rate for 1 hour → alert immediately
+- alert: ErrorBudgetFastBurn
+  expr: |
+    (
+      job:slo_errors:ratio1h{service="checkout"} > 14 * (1 - 0.999)
+      and
+      job:slo_errors:ratio5m{service="checkout"} > 14 * (1 - 0.999)
+    )
+  for: 2m
+
+# Slow burn: 2x normal burn rate for 6 hours → alert but not urgent
+- alert: ErrorBudgetSlowBurn
+  expr: |
+    job:slo_errors:ratio6h{service="checkout"} > 2 * (1 - 0.999)
+  for: 60m
+```
+
+**The synthetic monitor — the most important alert we have:**
+
+All internal metrics can be green while users experience failures (NetworkPolicy blocking ingress, CDN misconfiguration, DNS issue). Prometheus Blackbox Exporter hits the real public URL every 30 seconds:
+
+```yaml
+# Blackbox exporter job
+- job_name: blackbox_https
+  metrics_path: /probe
+  params:
+    module: [http_2xx]
+  static_configs:
+    - targets:
+        - https://api.yourapp.com/health
+        - https://api.yourapp.com/checkout/health
+  relabel_configs:
+    - source_labels: [__address__]
+      target_label: __param_target
+    - target_label: __address__
+      replacement: blackbox-exporter:9115
+
+# Alert on external probe failure
+- alert: ExternalEndpointDown
+  expr: probe_success{job="blackbox_https"} == 0
+  for: 2m
+  labels:
+    severity: critical
+```
+
+This is the last line of defense — if all pod metrics are green but `probe_success` is 0, something in the network path is broken.
+
+**Real scenario:** We started with 47 Prometheus alerts across 18 services. Average of 8 alert pages per day. Engineers were burned out. We ran a 2-month alert audit: for each alert, did it fire in the last 2 months? Was it actionable? Was it a symptom or a cause? Result: deleted 31 alerts, modified 12 to be symptom-based with better thresholds, kept 4. After the audit: 1–2 alert pages per day, all actionable, response quality improved dramatically. Alert fatigue is as dangerous as missing alerts — both result in the real problems being ignored.
+
+---
+
+## 6. What is the difference between reactive and proactive reliability engineering?
+
+Most teams do reactive reliability: something breaks, they fix it. Proactive reliability is engineering the system so failures are less likely and recovery is faster when they do happen.
+
+**Reactive reliability — responding to what's already broken:**
+
+```
+Pattern:
+  Incident happens → alert fires → on-call engineer wakes up
+  → diagnoses → fixes → postmortem → maybe adds a runbook
+  → repeat next month with same class of issue
+```
+
+Reactive is necessary — you can't eliminate all incidents. But if 80% of your engineering time is reactive, you're in a firefighting loop with no time to break it.
+
+**Proactive reliability — engineering for resilience before things break:**
+
+**1. Chaos engineering — deliberately break things in controlled conditions.**
+
+```bash
+# Chaos Mesh (Kubernetes) — inject failures to test system resilience
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: delay-payment-service
+spec:
+  action: delay
+  mode: one
+  selector:
+    namespaces: [prod]
+    labelSelectors:
+      app: payment-service
+  delay:
+    latency: "500ms"
+    jitter: "100ms"
+  duration: "5m"
+```
+
+Run this during business hours (controlled), watch dashboards. Does the upstream service time out gracefully? Do circuit breakers trip? Does the retry logic work? You find out now, not at 3 AM.
+
+**2. Game Days — practice incident response before a real incident.**
+
+Inject a failure scenario into staging with the on-call team present. "Your database just became read-only. What do you do?" The team runs the playbook, discovers it's outdated, updates it. The next real incident where the database goes read-only: team executes confidently in 5 minutes instead of 40.
+
+**3. SLO-driven development — reliability work is planned, not reactive.**
+
+Every quarter, we review error budget consumption by service:
+
+```
+service          | SLO   | budget consumed this quarter
+checkout         | 99.9% | 23%   → healthy
+payment          | 99.95%| 87%   → reliability work needed
+auth             | 99.99%| 12%   → healthy
+notification     | 99.5% | 3%    → healthy
+```
+
+Payment service consumed 87% of budget → it gets 20% of next sprint's engineering capacity for reliability work: fixing root causes of past incidents, adding circuit breakers, improving runbooks. This is planned work, not reactive firefighting.
+
+**4. Production readiness reviews — before shipping, not after.**
+
+Before a new service goes to production, it passes a checklist:
+- Does it have health check endpoints (readiness + liveness)?
+- Does it expose RED metrics?
+- Is there a Grafana dashboard?
+- Does it have an on-call runbook?
+- Has it been load tested at 2x expected production traffic?
+- Does it have circuit breakers for all downstream calls?
+- Are retries implemented with jitter to prevent thundering herd?
+
+If the answer to any of these is no, the service doesn't go to production. Not as a blocker — as a conversation about accepted risk.
+
+**5. Toil reduction — automate the manual work that's eating on-call time.**
+
+Toil is manual, repetitive operational work that could be automated. Runbooks that say "SSH to the server and restart the process" → automate it. Manual certificate renewals → automate with cert-manager. Manual scaling → automate with HPA/Karpenter.
+
+We track toil hours per sprint. If an on-call engineer spends > 20% of sprint time on toil, we create a reliability ticket to automate it. Reducing toil compounds: each automation frees time for the next reliability improvement.
+
+**The maturity progression:**
+
+```
+Level 1 (Reactive):    Alert fires → fix it → hope it doesn't happen again
+Level 2 (Postmortems): Fix it → write postmortem → add action items → some get done
+Level 3 (SLOs):        Track error budget → planned reliability work → fewer incidents
+Level 4 (Proactive):   Chaos engineering + game days + PRR + toil reduction
+                        → reliability is engineered, not hoped for
+```
+
+Most teams are at Level 1 or 2. Level 3 requires organizational buy-in (product must accept that error budget controls feature velocity). Level 4 requires engineering maturity and dedicated SRE capacity. You can start Level 3 tomorrow with SLOs and Prometheus — no organizational change needed.

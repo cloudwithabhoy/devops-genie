@@ -90,45 +90,7 @@ Jenkins hits the `/health` endpoint of the service after the manifest update. If
 
 ---
 
-## 3. Which type of Jenkins pipeline do you use and why?
-
-We use **Declarative pipelines** for all production pipelines. The answer isn't "Declarative is better" — it's understanding why it fits the team.
-
-**Declarative is what we chose because:**
-
-- **It's reviewable.** Every engineer on the team can read and understand a Declarative Jenkinsfile without knowing Groovy. When a pipeline fails at 2 AM, the on-call engineer can read the file and understand exactly what each stage does. With Scripted pipelines, you often end up with nested Groovy loops and closures that only the original author understands.
-
-- **It has guardrails.** Declarative syntax validates the pipeline structure before it runs. If you have a syntax error in a `stage` block, Jenkins tells you immediately. Scripted pipelines fail at runtime — halfway through a build.
-
-- **`post {}` blocks are clean.** Declarative has built-in `post { success {} failure {} always {} }` at both the pipeline and stage level. In Scripted, you have to wrap everything in try/catch/finally manually. We had a Scripted pipeline where a developer forgot the `finally` block — docker-compose containers leaked on the agent for weeks.
-
-- **Shared Library compatibility.** When we moved to Shared Libraries, Declarative made it easy to call library functions as steps. The pipeline structure remained readable; complex logic moved to the library.
-
-**When Scripted makes sense:**
-
-Scripted is Groovy — fully programmable. If you need dynamic stage generation (e.g., loop over 15 microservices and create a stage per service), Declarative can't do it cleanly. We have one legacy pipeline that generates stages dynamically from a config file — that one stays Scripted.
-
-```groovy
-// Scripted — dynamic stages
-def services = ['auth', 'orders', 'payments', 'notifications']
-node {
-  stage('Build All') {
-    def parallelStages = [:]
-    services.each { svc ->
-      parallelStages[svc] = {
-        sh "docker build -t ecr//${svc}:${GIT_COMMIT} ./${svc}"
-      }
-    }
-    parallel parallelStages
-  }
-}
-```
-
-**Real scenario:** We inherited a Scripted monolith pipeline from a previous team — 600 lines of Groovy, multiple nested closures, no comments. When the original author left, nobody could safely modify it. Every change was trial-and-error. We rewrote it in Declarative over a weekend. New pipeline: 80 lines. Every engineer can modify it confidently.
-
----
-
-## 4. What types of applications have you deployed using Jenkins pipelines?
+## 3. What types of applications have you deployed using CI/CD pipelines?
 
 This question is checking breadth of experience. The answer should cover different tech stacks and deployment targets — not just "Node.js to Kubernetes."
 
@@ -142,7 +104,7 @@ This question is checking breadth of experience. The answer should cover differe
 
 - **React/Next.js frontend** → Build artifacts (static files) pushed to S3, CloudFront invalidation triggered by Jenkins. This isn't a container deploy — it's `npm run build` → `aws s3 sync dist/ s3://my-bucket` → `aws cloudfront create-invalidation`.
 
-- **Lambda functions** → Python ZIP packages. Pipeline runs tests, packages dependencies with the function code, pushes to S3, triggers `aws lambda update-function-code`. For larger deployments, we use Terraform to manage the Lambda resource and Jenkins only updates the artifact.
+- **Lambda functions** → Python ZIP packages. Pipeline runs tests, packages dependencies with the function code, pushes to S3, triggers `aws lambda update-function-code`. For larger deployments, we use Terraform to manage the Lambda resource and the CI pipeline only updates the artifact.
 
 - **Terraform itself** → We have a pipeline that runs `terraform plan` on PRs (output posted as a PR comment) and `terraform apply` on merge to `main`. Every infra change goes through code review.
 
@@ -150,7 +112,7 @@ This question is checking breadth of experience. The answer should cover differe
 
 ---
 
-## 5. Which deployment tools have you used — Docker, Kubernetes, Helm, Terraform?
+## 4. Which deployment tools have you used — Docker, Kubernetes, Helm, Terraform?
 
 This is a "show me you've actually used these together, not just in isolation" question.
 
@@ -158,28 +120,148 @@ This is a "show me you've actually used these together, not just in isolation" q
 
 **Docker** is the packaging layer. Every application we deploy is a Docker image. The pipeline builds the image, scans it, and pushes it to ECR with an immutable tag. We never use `latest` in production — every image tag is the Git commit SHA. This means every running container in production is traceable to an exact commit.
 
-**Helm** is the Kubernetes packaging layer. We write Helm charts for every service — one chart per service with `values-dev.yaml`, `values-staging.yaml`, `values-prod.yaml`. The chart templates the Deployment, Service, Ingress, HPA, PDB, and ServiceAccount. When Jenkins updates the image tag, it updates the Helm values file. ArgoCD uses Helm to render and apply the manifests.
+**Helm** is the Kubernetes packaging layer. We write Helm charts for every service — one chart per service with `values-dev.yaml`, `values-staging.yaml`, `values-prod.yaml`. The chart templates the Deployment, Service, Ingress, HPA, PDB, and ServiceAccount. When the CI pipeline updates the image tag, it updates the Helm values file. ArgoCD uses Helm to render and apply the manifests.
 
 **Kubernetes (EKS)** is the runtime. Manages scheduling, scaling, health checks, service discovery. We manage the cluster itself with Terraform. We use Karpenter for node autoscaling — it replaced Cluster Autoscaler and reduced new node provisioning from 3 minutes to under 60 seconds.
 
-**Terraform** manages everything that isn't application code — EKS cluster, VPC, subnets, security groups, IAM roles, ECR repos, RDS, ElastiCache, S3 buckets. We use the `terraform-aws-modules/eks/aws` module as a base. State is in S3 with DynamoDB locking. Every Terraform change goes through a Jenkins pipeline: `plan` on PR, `apply` on merge.
+**Terraform** manages everything that isn't application code — EKS cluster, VPC, subnets, security groups, IAM roles, ECR repos, RDS, ElastiCache, S3 buckets. We use the `terraform-aws-modules/eks/aws` module as a base. State is in S3 with DynamoDB locking. Every Terraform change goes through a pipeline: `plan` on PR, `apply` on merge.
 
 **How they connect in a real deploy:**
 
 ```
 Developer merges code
-    → Jenkins: docker build → trivy scan → docker push ECR
-    → Jenkins: yq update image tag in Helm values → git push
+    → CI: docker build → trivy scan → docker push ECR
+    → CI: yq update image tag in Helm values → git push
     → ArgoCD: detects values change → helm template → kubectl apply
     → EKS: pods roll out on Karpenter-managed nodes
     → Prometheus: scrapes metrics → Grafana alert if error rate spikes
 ```
 
-Terraform sits outside this loop — it provisions the infrastructure that this flow runs on. If we need a new EKS node group or a new ECR repo, that's a Terraform PR, not a Jenkins deploy.
+Terraform sits outside this loop — it provisions the infrastructure that this flow runs on. If we need a new EKS node group or a new ECR repo, that's a Terraform PR, not a CI deploy.
 
 ---
 
-## 6. A deployment just caused widespread failures across the platform — how do you respond?
+## 6. How do you ensure stability and efficiency across your CI/CD and cloud environments?
+
+This is a systems-thinking question. The answer spans process, tooling, and culture — not just listing tools.
+
+**Stability: preventing and recovering from failures.**
+
+**1. Environment parity — staging must mirror production.**
+
+The most common cause of "works in staging, breaks in prod" is environmental differences. We enforce parity via:
+
+```hcl
+# Same Terraform module for staging and prod — only variables differ
+module "eks" {
+  source         = "../modules/eks"
+  cluster_name   = var.cluster_name       # "staging-cluster" vs "prod-cluster"
+  instance_types = var.instance_types     # ["t3.large"] vs ["m5.large"]
+  min_size       = var.min_size           # 2 vs 3
+}
+```
+
+Schema migrations run in staging first. Config changes go through the same Terraform pipeline for both environments. If staging and prod drift, the drift gets caught in Terraform plan.
+
+**2. Progressive delivery — don't ship to all users at once.**
+
+Every significant change goes through: staging → canary (5% prod traffic) → prod (100%). The canary stage catches regressions that staging misses because staging traffic is synthetic.
+
+```yaml
+# Argo Rollouts canary with auto-abort
+analysis:
+  templates:
+    - templateName: success-rate   # PromQL: error rate < 2%
+  args:
+    - name: service-name
+      value: order-service
+# If error rate exceeds 2% at 5% traffic → auto-abort → 0 users affected
+```
+
+**3. Health checks and automatic rollback in the pipeline.**
+
+The pipeline only succeeds when the deployment is confirmed healthy:
+
+```groovy
+sh 'argocd app wait order-service --health --timeout 300'
+sh 'curl -f https://api.prod.com/health'     // Smoke test
+// If either fails → kubectl rollout undo → Slack alert → pipeline marked failed
+```
+
+**4. Resource limits and PodDisruptionBudgets to prevent cascading failures.**
+
+```yaml
+# Every service has memory limits (prevent OOM cascade)
+resources:
+  limits:
+    memory: "512Mi"
+
+# PDB prevents all pods being evicted simultaneously during node maintenance
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+spec:
+  minAvailable: 2   # Always keep at least 2 pods running
+```
+
+---
+
+**Efficiency: getting value out of CI/CD without wasting time or money.**
+
+**1. Parallel pipeline stages — cut build time.**
+
+Sequential: test → lint → build → scan = 18 minutes
+Parallel (test + lint + scan simultaneously, then build): 7 minutes
+
+```groovy
+stage('Validate') {
+  parallel {
+    stage('Tests') { steps { sh 'pytest tests/' } }
+    stage('Lint')  { steps { sh 'flake8 app/' } }
+    stage('SAST')  { steps { sh 'bandit -r app/' } }
+  }
+}
+```
+
+**2. Layer caching in Docker builds — don't reinstall dependencies every build.**
+
+```dockerfile
+# Dependencies change rarely → cache them
+COPY requirements.txt .
+RUN pip install -r requirements.txt   ← cached unless requirements.txt changes
+
+# Code changes frequently → copy it last
+COPY src/ ./src/
+```
+
+Without proper layer ordering: 4-minute Docker build every commit. With caching: 45-second build if only source code changed.
+
+**3. Spot instances for CI agents — 70% cost reduction.**
+
+Build agents don't need to be on-demand. A PR build that gets interrupted by spot interruption just restarts — a minor inconvenience, not an outage. On-demand for production deploys; spot for PR builds and test runs.
+
+**4. Fail fast — expensive stages run last.**
+
+```
+Order: lint (5s) → unit tests (30s) → integration tests (2m) → build image (3m) → push (1m)
+```
+
+Lint failure aborts before the 6-minute build+push. A developer gets feedback in 35 seconds instead of 7 minutes.
+
+**5. Artifact reuse — build once, deploy everywhere.**
+
+The same Docker image (same SHA) goes through staging, canary, and prod. It's built once in CI, not rebuilt per environment. This ensures what passed staging tests is exactly what runs in prod.
+
+---
+
+**Stability + Efficiency together: GitOps.**
+
+GitOps (ArgoCD watching the manifest repo) ties both together. Stability: every deployment is a Git commit — full audit trail, rollback is a `git revert`. Efficiency: ArgoCD continuously reconciles desired vs actual state — if a pod gets manually modified in prod, ArgoCD corrects it automatically. Zero manual `kubectl apply` in production.
+
+**Real metric:** Before this architecture, our mean time to deploy (code merged → in production) was 45 minutes. Mean time to detect a regression was 2 hours (manual monitoring). After: deploy time 12 minutes, regression detection 4 minutes (automated smoke tests + alert correlation in Grafana). MTTR dropped from 47 minutes average to 8 minutes (auto-rollback catches most issues before users notice).
+
+---
+
+## 5. A deployment just caused widespread failures across the platform — how do you respond?
 
 "Widespread failures" means the deployment didn't just break one service — it broke something shared. This could be a common library, a shared config, or a central service that everything depends on.
 

@@ -366,3 +366,146 @@ The postmortem document we write:
 - **Action items:** Specific changes, each with an owner and due date
 
 The action items matter most. A postmortem without action items is just documentation of failure. A postmortem with specific, assigned, time-bound action items is prevention.
+
+---
+
+## 7. Walk me through your Sev-1 incident handling strategy from alert to resolution.
+
+Sev-1 is your most critical category — complete service outage or data at risk. The strategy has three phases: respond, resolve, review. Skipping any phase means the incident happens again.
+
+**What makes something Sev-1:**
+
+```
+Sev-1: Complete outage (0% of users can use the service)
+       Data loss or corruption
+       Security breach
+       Payment processing down
+
+Sev-2: Partial outage (some users affected, no data risk)
+       Core features degraded but workaround exists
+
+Sev-3: Minor degradation (users not directly affected yet)
+       Performance issue, elevated error rate below threshold
+```
+
+Don't declare Sev-1 for Sev-2 problems — it burns out the team and trains people to ignore the declaration. Don't under-declare a real Sev-1 — it delays response.
+
+**Phase 1 — Respond (first 5 minutes):**
+
+```
+T+0:00  Alert fires → PagerDuty wakes on-call engineer
+T+0:02  On-call acknowledges, posts in #incidents:
+        "🔴 SEV-1: [service] is down. I'm on it. Next update in 10 min."
+T+0:03  Incident channel created: #inc-2024-01-15-checkout-outage
+T+0:04  On-call assigns roles:
+        - Incident Commander (IC): coordinates, communicates, decides
+        - Technical Lead: does the actual debugging
+        - Comms: updates status page + stakeholders
+T+0:05  IC declares incident formally, severity confirmed
+```
+
+**The incident commander role is the most important:**
+
+The IC doesn't debug. The IC coordinates — keeps track of what the tech lead is doing, fields questions from stakeholders, makes the call to escalate or rollback. Without an IC, every engineer starts debugging independently, information isn't shared, and rollback decisions happen too late.
+
+```
+IC responsibilities:
+- Keep the incident channel up to date (updates every 10 minutes minimum)
+- Make rollback/escalation decisions when tech lead is heads-down
+- Prevent engineers from going down rabbit holes for > 20 minutes
+- Call in additional help if needed
+- Update status page
+```
+
+**Phase 2 — Resolve (first 30 minutes drives most of the decisions):**
+
+```
+T+0:05  Establish: what's broken? what's the scope? since when?
+        → Check Grafana: when did the error rate spike?
+        → Check ArgoCD: was anything deployed around that time?
+        → Check CloudTrail: was any infra changed?
+
+T+0:10  Form a hypothesis (don't investigate multiple theories simultaneously)
+        "Last deployment was 22 minutes ago. Error rate spiked 20 minutes ago.
+         Hypothesis: new deployment caused it."
+
+T+0:15  Rollback or investigate based on hypothesis
+        If hypothesis is deployment → rollback immediately
+        If no recent deployment → investigate dependency health
+
+T+0:25  Rollback completed or root cause identified
+        IC: "Rolling back [service]. ETA 3 minutes."
+
+T+0:30  Verify recovery
+        → Error rate back to baseline
+        → Synthetic monitor returning 200
+        → IC: "Service restored. Monitoring for 10 minutes before declaring resolved."
+
+T+0:40  Declare resolved
+        IC: "SEV-1 resolved. [service] fully restored. Duration: 40 minutes.
+             Postmortem scheduled for Thursday at 2 PM."
+```
+
+**The 20-minute rule:**
+
+If the tech lead has been on one hypothesis for 20 minutes with no progress, the IC calls it and pivots:
+
+> "We've been on the database hypothesis for 20 minutes. Let's pivot to checking the network. What's the next thing to check?"
+
+No ego, no sunk cost. Focused debugging under pressure needs external time-keeping.
+
+**The rollback default:**
+
+Unless rolling back has a known side effect (migration already ran, API contract changed), default to rollback. Debugging while users are down is the wrong order. Restore service, then investigate.
+
+**Phase 3 — Review (within 48 hours):**
+
+The postmortem is blameless and mandatory. Blameless means: "What failed in the system?" not "Who made a mistake?"
+
+**Postmortem template we use:**
+
+```markdown
+## Incident: [title]
+**Date:** 2024-01-15
+**Duration:** 40 minutes
+**Severity:** Sev-1
+**Impact:** 100% of checkout requests failing, ~2,000 users affected
+
+## Timeline
+2:14 AM - Alert fired: checkout error rate > 50%
+2:15 AM - On-call acknowledged, incident channel opened
+2:22 AM - Identified: new auth service version deployed at 2:10 AM
+2:23 AM - Rollback initiated
+2:25 AM - Rollback complete, error rate dropping
+2:30 AM - Error rate back to baseline, monitoring
+2:40 AM - Incident declared resolved
+
+## Root Cause
+New auth service version used a different JWT signing key format.
+Downstream services (checkout, orders) couldn't validate tokens.
+No compatibility testing between auth and downstream consumers.
+
+## What Went Well
+- Alert fired within 1 minute of the issue starting
+- Rollback was fast (< 3 minutes)
+- Incident channel communication was clear
+
+## What Could Be Better
+- No automated compatibility test between auth token format and consumers
+- Rollback decision took 7 minutes — should have been faster
+
+## Action Items
+| Action | Owner | Due Date |
+|---|---|---|
+| Add JWT format compatibility test to auth service CI | @alice | Jan 22 |
+| Add rollback decision to incident runbook: "default rollback if deployment in last 30 min" | @bob | Jan 20 |
+| Add consumer contract testing between auth and checkout | @alice | Feb 1 |
+```
+
+**What distinguishes mature incident response from reactive firefighting:**
+
+- Roles are clear before incidents happen (IC, tech lead, comms)
+- Rollback is the default, not the last resort
+- Postmortems happen for every Sev-1 and most Sev-2s
+- Action items are tracked and closed — not just written
+- MTTR trends downward quarter over quarter because the system is improving, not just getting patched

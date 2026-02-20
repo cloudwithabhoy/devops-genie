@@ -393,3 +393,124 @@ terraform import aws_db_instance.prod arn:aws:rds:ap-south-1:123456789:db:prod-p
 **Real scenario for import:** We inherited an AWS account with 6 manually created security groups, 2 VPCs, and an RDS cluster — all from a previous vendor. None of it was in Terraform. We had to `terraform import` each resource one by one, then write matching `.tf` blocks until `terraform plan` showed "No changes." Took two days. The hardest part was writing the `.tf` to exactly match what existed — any attribute mismatch shows as a diff and needs reconciliation.
 
 **Key insight:** After `terraform import`, always run `terraform plan` immediately. If the plan shows changes, your `.tf` doesn't match reality yet. Do NOT run `apply` until the plan is clean — otherwise Terraform will "fix" the resource to match your code, which might involve destroying or modifying production infrastructure.
+
+---
+
+## 5. What is the difference between `count` and `for_each` in Terraform?
+
+Both create multiple instances of a resource from a single block. The choice between them determines how Terraform identifies resources in state — and getting it wrong causes unnecessary destroys.
+
+**`count` — create N identical resources by index.**
+
+```hcl
+resource "aws_iam_user" "developers" {
+  count = 3
+  name  = "developer-${count.index}"
+}
+
+# Creates:
+# aws_iam_user.developers[0]  → "developer-0"
+# aws_iam_user.developers[1]  → "developer-1"
+# aws_iam_user.developers[2]  → "developer-2"
+```
+
+References: `aws_iam_user.developers[0].arn`, `count.index` inside the block.
+
+**`for_each` — create one resource per map entry or set item.**
+
+```hcl
+resource "aws_iam_user" "developers" {
+  for_each = toset(["alice", "bob", "charlie"])
+  name     = each.key
+}
+
+# Creates:
+# aws_iam_user.developers["alice"]   → "alice"
+# aws_iam_user.developers["bob"]     → "bob"
+# aws_iam_user.developers["charlie"] → "charlie"
+```
+
+References: `aws_iam_user.developers["alice"].arn`, `each.key` / `each.value` inside the block.
+
+**The critical difference — what happens when you remove an item:**
+
+With `count`, resources are identified by index. Remove the middle item → Terraform destroys and recreates everything after it:
+
+```hcl
+# Before
+count = 3  # [0]="dev-0", [1]="dev-1", [2]="dev-2"
+
+# Remove index 1 (dev-1)
+count = 2  # Terraform sees: [0]="dev-0", [1]="dev-2"
+           # It thinks: [1] changed from "dev-1" to "dev-2" → DESTROY + CREATE
+           # And [2] was removed → DESTROY dev-2
+           # Result: dev-1 destroyed, dev-2 destroyed and recreated as [1]
+           # Even though you only wanted to remove dev-1
+```
+
+With `for_each`, resources are identified by key. Remove an item → only that specific item is destroyed:
+
+```hcl
+# Before
+for_each = toset(["alice", "bob", "charlie"])
+
+# Remove "bob"
+for_each = toset(["alice", "charlie"])
+# Terraform sees: "bob" no longer in set → DESTROY aws_iam_user.developers["bob"]
+# alice and charlie: unchanged → no action
+# Exactly what you intended
+```
+
+**When to use `count`:**
+
+- Creating N identical resources where the index doesn't matter for identity
+- Simple toggles: `count = var.enable_feature ? 1 : 0`
+
+```hcl
+# Toggle a resource on/off based on a variable
+resource "aws_cloudwatch_log_group" "app" {
+  count = var.enable_logging ? 1 : 0
+  name  = "/app/${var.service_name}"
+}
+
+# Reference it
+arn = length(aws_cloudwatch_log_group.app) > 0 ? aws_cloudwatch_log_group.app[0].arn : ""
+```
+
+**When to use `for_each`:**
+
+- Creating resources from a list/map where each has a meaningful identifier
+- When you might add or remove items (to avoid destroying/recreating unrelated resources)
+- When resources have different configurations
+
+```hcl
+# Map with different values per resource
+variable "s3_buckets" {
+  default = {
+    "artifacts" = { versioning = true,  encryption = true  }
+    "logs"      = { versioning = false, encryption = true  }
+    "backups"   = { versioning = true,  encryption = true  }
+  }
+}
+
+resource "aws_s3_bucket" "buckets" {
+  for_each = var.s3_buckets
+  bucket   = "${each.key}-${var.environment}"
+}
+
+resource "aws_s3_bucket_versioning" "buckets" {
+  for_each = { for k, v in var.s3_buckets : k => v if v.versioning }
+  bucket   = aws_s3_bucket.buckets[each.key].id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+```
+
+**Real scenario where `count` caused pain:**
+
+We had `count = length(var.availability_zones)` for subnets. When we changed the AZ list from `["ap-south-1a", "ap-south-1b", "ap-south-1c"]` to `["ap-south-1b", "ap-south-1c", "ap-south-1a"]` (reordered), Terraform wanted to destroy and recreate all 3 subnets — even though the same 3 AZs were being used. The plan showed `-/+` for all subnets, which would have destroyed the EKS node groups running in them.
+
+Migrated to `for_each = toset(var.availability_zones)`. Now reordering the list causes zero changes in the plan. Resources are identified by AZ name, not position.
+
+**Rule of thumb:** Default to `for_each`. Use `count` only for simple on/off toggles or when creating genuinely identical, interchangeable resources.

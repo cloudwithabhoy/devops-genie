@@ -543,3 +543,175 @@ Higher-level tools that abstract over CloudFormation or Terraform. SAM is AWS-na
 **What we use in practice:**
 
 New Lambda functions: Terraform manages the resource, CI pipeline updates the code via S3 + `update-function-code`. For large ML inference functions: container image via ECR. All functions use Lambda versioning + aliases — `prod` alias always points to the latest stable version, and we can point it to a previous version for instant rollback without redeployment.
+
+---
+
+## 9. How do you reduce or manage cloud costs effectively?
+
+Cloud costs grow silently. Services get provisioned, traffic patterns change, and the bill keeps climbing unless you actively manage it. Here's how I approach cost reduction systematically.
+
+**Start with visibility — you can't cut what you can't see.**
+
+```bash
+# AWS Cost Explorer — spot which services and accounts are driving spend
+# Enable cost allocation tags: every resource gets tagged with Team, Service, Environment
+# Tag policy example (Terraform):
+resource "aws_resourcegroups_group" "cost_center" { ... }
+```
+
+We enforce tagging via AWS Config rules — any resource without mandatory tags (`Team`, `Service`, `Environment`) generates a compliance finding. Untagged spend is the enemy of cost control.
+
+**Right-size compute first — the biggest lever.**
+
+```bash
+# AWS Compute Optimizer recommendations
+aws compute-optimizer get-ec2-instance-recommendations \
+  --account-ids 123456789012 \
+  --output json | jq '.instanceRecommendations[] | {instance: .instanceName, current: .currentInstanceType, recommended: .recommendationOptions[0].instanceType}'
+```
+
+We found instances consistently running at 12% CPU with 4GB RAM allocated and 400MB used. Compute Optimizer recommended moving from `m5.large` to `t3.small` — 70% cost reduction for those instances.
+
+In Kubernetes — VPA (Vertical Pod Autoscaler) in recommendation mode:
+
+```yaml
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+spec:
+  updatePolicy:
+    updateMode: "Off"    # Recommendation only — don't auto-apply
+```
+
+`kubectl describe vpa <name>` shows actual p95 CPU/memory vs what's requested. We had pods requesting 1 CPU and using 80m. Tuning requests based on VPA recommendations reduced our EKS node count by 30%.
+
+**Use spot/preemptible instances for non-critical workloads.**
+
+Spot instances are 60–90% cheaper than on-demand. Risk: they can be interrupted with 2-minute notice.
+
+```hcl
+# EKS node group with mixed on-demand + spot
+resource "aws_eks_node_group" "workers" {
+  capacity_type = "SPOT"
+  instance_types = ["m5.large", "m5a.large", "m4.large"]  # Multiple types = fewer interruptions
+}
+```
+
+What runs on spot: CI/CD build agents, dev/staging environments, batch processing jobs, non-critical background workers. What runs on on-demand: production web services, databases (RDS is already managed — use Reserved Instances instead).
+
+**Reserved Instances and Savings Plans for predictable workloads.**
+
+```
+On-demand: $0.096/hr for m5.large
+1-year No Upfront RI: $0.057/hr  → 40% savings
+3-year No Upfront RI: $0.037/hr  → 61% savings
+Compute Savings Plan: ~40% savings, flexible across instance families
+```
+
+We buy Compute Savings Plans (not instance-specific RIs) because they're flexible — if we move from `m5.large` to `m6i.large`, the Savings Plan still applies. RIs lock you to a specific instance type.
+
+**Eliminate waste — orphaned resources are free money wasted.**
+
+```bash
+# Unattached EBS volumes
+aws ec2 describe-volumes \
+  --filters Name=status,Values=available \
+  --query 'Volumes[].{ID:VolumeId,Size:Size,CreatedOn:CreateTime}'
+
+# Unused Elastic IPs (charged when not attached)
+aws ec2 describe-addresses \
+  --query 'Addresses[?InstanceId==null].PublicIp'
+
+# Old snapshots (automated but manual ones accumulate)
+aws ec2 describe-snapshots --owner-ids self \
+  --query 'Snapshots[?StartTime<`2024-01-01`].SnapshotId'
+
+# Idle load balancers (no healthy targets for 30+ days)
+# Check via CloudWatch: RequestCount = 0 for 30 days
+```
+
+We run a weekly Lambda that reports orphaned resources to Slack. In the first month, we found 47 unattached EBS volumes (some from instances terminated 8 months ago), 12 unused Elastic IPs, and 3 load balancers with no targets. Total cleanup: $340/month.
+
+**NAT Gateway — often the hidden cost driver.**
+
+NAT Gateway charges $0.045/GB of processed data. If your EKS nodes in private subnets pull Docker images through NAT Gateway every build, costs add up fast.
+
+```
+Fix: VPC Endpoints for ECR and S3
+→ Image pulls go through private network, not NAT Gateway
+→ Cost: $7.30/month per endpoint
+→ Savings: $800/month in NAT data processing fees (at our image pull volume)
+```
+
+**Real outcome:** We ran a 3-week cost optimization sprint:
+- Right-sized EC2/pods using Compute Optimizer + VPA: -28%
+- Moved CI build agents to spot: -$400/month
+- Purchased Compute Savings Plans for baseline load: -35%
+- VPC endpoints for ECR/S3/Secrets Manager: -$800/month
+- Cleaned up orphaned resources: -$340/month
+- Total reduction: 42% lower AWS bill, from $18,000/month to $10,400/month
+
+**Key principle:** Cost optimization is a continuous process, not a one-time event. We review Cost Explorer weekly, have Compute Optimizer recommendations as a standing agenda item in sprint planning, and budget alerts trigger when spend exceeds forecast by more than 10%.
+
+---
+
+## 8. NLB vs ALB in a microservices architecture — which do you choose and when?
+
+In a microservices architecture, this is not a binary choice. We use both, for different services, for specific reasons.
+
+**The fundamental difference:**
+
+- **ALB (Layer 7)** — understands HTTP/HTTPS. Can route based on URL path, hostname, headers, query params, and HTTP method. Supports WebSocket, HTTP/2, WAF, and authentication (Cognito/OIDC)
+- **NLB (Layer 4)** — understands TCP/UDP/TLS. Routes based on IP and port only. No HTTP awareness. Extremely low latency, preserves source IP, supports static Elastic IPs
+
+**In microservices, ALB covers ~90% of use cases:**
+
+Most microservices communicate over HTTP/gRPC. ALB's path-based and hostname-based routing lets you serve all your services from a single load balancer:
+
+```yaml
+# Single ALB, multiple services via path routing
+Rules:
+  /api/orders/*    → order-service target group
+  /api/payments/*  → payment-service target group
+  /api/users/*     → user-service target group
+  /                → frontend target group
+```
+
+One ALB instead of one NLB per service cuts load balancer costs significantly. ALB integrates with WAF — one WAF ACL protects all services. ALB terminates TLS and handles certificates via ACM.
+
+**When NLB is the right choice in microservices:**
+
+**1. gRPC / HTTP/2 with long-lived streams.**
+ALB supports gRPC, but NLB handles long-lived TCP streams more efficiently. If your microservices communicate via gRPC streaming (bi-directional streams, server-push), NLB passes TCP through without interference. ALB inspects and potentially resets long-lived HTTP connections.
+
+**2. Non-HTTP protocols.**
+A microservice exposing a raw TCP protocol (message broker, custom binary protocol, database proxy). ALB doesn't understand non-HTTP protocols. NLB just forwards TCP packets.
+
+**3. Static IP requirement for firewall whitelisting.**
+NLB gives you one static Elastic IP per AZ. ALB IPs are dynamic and change. If a customer's firewall must whitelist your IP, you need NLB. We had a financial services customer who required IP whitelisting for compliance — we put NLB in front of that service specifically.
+
+**4. Extreme low latency (sub-millisecond matters).**
+NLB operates at layer 4 with minimal processing overhead — microseconds vs ALB's milliseconds. For high-frequency trading, real-time gaming, or services where request latency is measured in microseconds, NLB wins. For typical API services where requests take 20–500ms, the latency difference is irrelevant.
+
+**5. Preserving client source IP in the TCP connection itself.**
+ALB adds `X-Forwarded-For` headers (HTTP layer). If your service needs the real client IP in the TCP socket (not in a header) — for IP-based rate limiting in legacy apps that don't read headers — NLB passes it through via Proxy Protocol.
+
+**Our microservices architecture decision:**
+
+```
+Internet
+    ↓
+CloudFront (CDN + DDoS protection)
+    ↓
+WAF (SQL injection, rate limiting)
+    ↓
+ALB (HTTP/HTTPS, path routing, TLS termination)
+    ↓
+EKS pods (order, payment, user, notification services)
+
+Exceptions:
+- Internal gRPC service mesh → NLB (long-lived streams)
+- Legacy TCP-based reporting tool → NLB (non-HTTP)
+- Customer-facing API for IP-whitelisting customer → NLB (static IP)
+```
+
+**Real cost comparison:** Before consolidating, we had 6 ALBs (one per service) and 1 NLB. After: 1 ALB for HTTP services (path routing) + 1 NLB for TCP services. Saved $180/month in load balancer hourly charges. More importantly, WAF was only on 1 ALB instead of 6 — one rule update protects all services.
