@@ -173,3 +173,68 @@ git rebase origin/main    # Replay your commits on top of current main
 
 **Real scenario:** We had a merge conflict in our Terraform state configuration — two engineers both modified `backend.tf` in the same week. One added a new S3 bucket key path, the other changed the DynamoDB table name. The conflict was clean to resolve (combine both changes), but we needed to make sure neither engineer's terraform had already applied with their version. We checked Terraform state before resolving to confirm no partial applies had happened, then resolved the conflict and ran `terraform plan` to verify the combined result was clean.
 
+---
+
+## 3. How do you generate a Personal Access Token (PAT) in GitHub?
+
+A Personal Access Token (PAT) is used in place of a password when authenticating with GitHub from the CLI, scripts, CI/CD systems, or tools. GitHub removed password authentication for Git operations in 2021 — PAT is the replacement.
+
+**Steps to generate a PAT (Classic):**
+
+1. Go to **GitHub → Settings** (click your avatar top-right → Settings)
+2. In the left sidebar, scroll down to **Developer settings**
+3. Click **Personal access tokens → Tokens (classic)**
+4. Click **Generate new token → Generate new token (classic)**
+5. Give it a descriptive **Note** (e.g., "Laptop CLI", "Jenkins CI", "Deployment Script")
+6. Set **Expiration** — choose a sensible expiry (30, 60, 90 days, or custom). Avoid "No expiration" for security
+7. Select **Scopes** (permissions):
+   - `repo` — full access to repositories (read, write, delete). Required for most operations
+   - `read:org` — if you need to access organization resources
+   - `workflow` — if you need to trigger or modify GitHub Actions
+   - `write:packages` — if you need to push to GitHub Container Registry (GHCR)
+8. Click **Generate token**
+9. **Copy the token immediately** — GitHub shows it only once. If you close the page without copying, you must regenerate it.
+
+**Using the token:**
+
+```bash
+# Option 1: Use token as password in git operations
+git clone https://github.com/org/repo.git
+# Username: your-github-username
+# Password: <paste the token here>
+
+# Option 2: Embed in the remote URL (for scripts — be careful with secrets)
+git clone https://<username>:<token>@github.com/org/repo.git
+
+# Option 3: Set in git credential store
+git config --global credential.helper store
+git clone https://github.com/org/repo.git
+# Enter username + token once → stored in ~/.git-credentials
+
+# Option 4: Use GitHub CLI (authenticates once)
+gh auth login
+# → select GitHub.com, HTTPS, paste token
+# gh handles all subsequent authentication automatically
+```
+
+**For CI/CD systems (Jenkins, GitHub Actions, GitLab CI):**
+
+```bash
+# In GitHub Actions — use the built-in GITHUB_TOKEN (no manual PAT needed for same-repo operations)
+- name: Checkout
+  uses: actions/checkout@v4
+  with:
+    token: ${{ secrets.GITHUB_TOKEN }}
+
+# For cross-repo access or external tools — store PAT as a secret:
+# GitHub → repo Settings → Secrets and variables → Actions → New secret
+# Name: GH_PAT, Value: <your token>
+
+- name: Clone another repo
+  run: git clone https://x-access-token:${{ secrets.GH_PAT }}@github.com/org/other-repo.git
+```
+
+**Fine-grained PATs (the newer, more secure option):**
+
+GitHub now offers **Fine-grained tokens** (Settings → Developer settings → Personal access tokens → Fine-grained tokens) that allow per-repository permissions rather than all-or-nothing repository access. Prefer these for new integrations — they follow the principle of least privilege and can be scoped to specific repositories.
+

@@ -331,4 +331,321 @@ sh "docker build --build-arg DB_PASS=$DB_PASSWORD ."
 // ARG values are stored in docker history — visible via docker image inspect
 ```
 
-**Real incident:** A developer ran `echo $AWS_SECRET_ACCESS_KEY` inside a Jenkins pipeline step to debug a credential issue. The console output was visible to all engineers with Jenkins read access — 23 people. The access key was rotated within 10 minutes of discovery, but CloudTrail showed no unauthorized usage. After this: mandatory pipeline code review that checks for `echo` + credential variable patterns, and all credentials moved from Jenkins store to Secrets Manager with the IAM instance profile approach. No human can now see the actual secret values — not even Jenkins admins.
+**Real incident:** A developer ran `echo $AWS_SECRET_ACCESS_KEY` inside a Jenkins pipeline step to debug a credential issue.
+
+---
+
+## 5. What is the concept of Pipeline as Code in Jenkins?
+
+Pipeline as Code means the CI/CD pipeline definition is stored in a file (`Jenkinsfile`) inside the application's Git repository — not configured through the Jenkins UI. The pipeline travels with the code, is versioned, reviewed, and audited exactly like application code.
+
+**The problem Pipeline as Code solves:**
+
+Before Pipeline as Code, Jenkins jobs were configured through the GUI. This created two problems:
+- **No version history** — if someone changed a build step, there was no record of what changed or who changed it
+- **No reproducibility** — if Jenkins went down or you needed to recreate a job, the configuration was gone or had to be manually re-entered
+
+With a `Jenkinsfile` in the repository:
+- Every pipeline change is a Git commit — you see who changed what and can revert it
+- The pipeline is recreated automatically when Jenkins detects the `Jenkinsfile`
+- Code review applies to pipeline changes the same as application changes
+- Different branches can have different pipeline configurations (feature branch builds test only; main builds, tests, and deploys to prod)
+
+**What a Jenkinsfile looks like:**
+
+```groovy
+// Jenkinsfile stored at root of the repository
+pipeline {
+  agent { label 'docker-agent' }
+
+  environment {
+    IMAGE_NAME = "myapp"
+    ECR_REPO   = "123456789012.dkr.ecr.ap-south-1.amazonaws.com/myapp"
+  }
+
+  stages {
+    stage('Build') {
+      steps {
+        sh 'docker build -t $IMAGE_NAME:$GIT_COMMIT .'
+      }
+    }
+    stage('Test') {
+      steps {
+        sh 'docker run --rm $IMAGE_NAME:$GIT_COMMIT pytest tests/'
+      }
+    }
+    stage('Push') {
+      steps {
+        sh '''
+          aws ecr get-login-password | docker login --username AWS --password-stdin $ECR_REPO
+          docker tag $IMAGE_NAME:$GIT_COMMIT $ECR_REPO:$GIT_COMMIT
+          docker push $ECR_REPO:$GIT_COMMIT
+        '''
+      }
+    }
+    stage('Deploy') {
+      when { branch 'main' }
+      steps {
+        sh "helm upgrade --install myapp ./helm --set image.tag=$GIT_COMMIT"
+      }
+    }
+  }
+}
+```
+
+**How Jenkins picks it up:**
+
+A **Multibranch Pipeline** job scans the Git repository for `Jenkinsfile` in every branch. When a new branch is pushed, Jenkins automatically creates a new pipeline for it. When the branch is deleted, Jenkins removes the pipeline. No manual job creation needed.
+
+---
+
+## 6. How do you implement a manual approval gate in a Jenkins pipeline?
+
+When a deployment needs a human to approve before proceeding — typically before pushing to production — you use the `input` step.
+
+```groovy
+pipeline {
+  agent any
+
+  stages {
+    stage('Build & Test') {
+      steps {
+        sh 'mvn clean package'
+        sh 'mvn test'
+      }
+    }
+
+    stage('Deploy to Staging') {
+      steps {
+        sh 'helm upgrade --install myapp ./helm -f values/staging.yaml'
+      }
+    }
+
+    stage('Approval: Deploy to Production') {
+      steps {
+        // Pipeline pauses here and waits for a human to click Proceed or Abort
+        input message: 'Deploy to production?',
+              ok: 'Proceed',
+              submitter: 'devops-leads,release-managers'
+              // Only users in these groups can approve
+      }
+    }
+
+    stage('Deploy to Production') {
+      steps {
+        sh 'helm upgrade --install myapp ./helm -f values/prod.yaml --set image.tag=$GIT_COMMIT'
+      }
+    }
+  }
+}
+```
+
+**What happens when the pipeline reaches `input`:**
+- The build pauses and shows a "Proceed / Abort" button in the Jenkins UI
+- Jenkins sends a notification (email, Slack — if configured)
+- The pipeline holds for the configured timeout (default: forever — set a timeout)
+- If no one approves within the timeout, the pipeline can abort automatically
+
+**Adding a timeout to the approval step:**
+
+```groovy
+stage('Approval: Deploy to Production') {
+  steps {
+    timeout(time: 2, unit: 'HOURS') {
+      input message: 'Deploy to production?',
+            ok: 'Deploy Now',
+            submitter: 'devops-leads'
+    }
+  }
+}
+// If no approval in 2 hours → pipeline aborts automatically
+```
+
+**Capturing the approver's identity:**
+
+```groovy
+stage('Approval') {
+  steps {
+    script {
+      def approver = input message: 'Approve production deployment?',
+                           submitter: 'devops-leads',
+                           submitterParameter: 'APPROVED_BY'
+      echo "Deployment approved by: ${approver}"
+      // Log to audit trail
+    }
+  }
+}
+```
+
+---
+
+## 7. What are agents in Jenkins and runners in GitHub Actions / GitLab CI?
+
+All three CI/CD tools have the same concept — a machine that executes pipeline steps — but they use different terminology.
+
+**Jenkins Agents:**
+
+An agent is a machine (physical, VM, Docker container, or Kubernetes pod) connected to the Jenkins Controller that actually runs build steps. The Controller only orchestrates; agents do the work.
+
+```groovy
+// Declarative pipeline — agent label
+pipeline {
+  agent { label 'docker-agent' }   // Run on any agent with this label
+  stages { ... }
+}
+
+// Kubernetes pod agent (dynamic — spins up a pod per build)
+pipeline {
+  agent {
+    kubernetes {
+      yaml '''
+        apiVersion: v1
+        kind: Pod
+        spec:
+          containers:
+          - name: docker
+            image: docker:24-dind
+            securityContext:
+              privileged: true
+      '''
+    }
+  }
+}
+```
+
+Agents can be **static** (always-on VMs registered to Jenkins) or **dynamic** (Kubernetes pods created per build, destroyed after).
+
+**GitHub Actions Runners:**
+
+A runner is the equivalent of a Jenkins agent — the machine that executes a workflow job.
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest      # GitHub-hosted runner (managed by GitHub)
+    # OR
+    runs-on: self-hosted        # Your own machine registered as a runner
+```
+
+GitHub-hosted runners are ephemeral VMs GitHub spins up and tears down per job. Self-hosted runners are machines you register with GitHub — useful when you need access to internal networks or specific hardware.
+
+**GitLab CI Runners:**
+
+Same concept, called a runner. Registered to a GitLab instance with a registration token.
+
+```yaml
+build:
+  tags:
+    - docker    # Run on a runner with the "docker" tag
+    - linux
+  script:
+    - docker build .
+```
+
+**Comparison:**
+
+| | Jenkins | GitHub Actions | GitLab CI |
+|---|---|---|---|
+| Term | Agent | Runner | Runner |
+| Controller | Jenkins Controller | GitHub.com | GitLab instance |
+| Managed option | No (you manage all) | GitHub-hosted runners | GitLab.com shared runners |
+| Self-hosted | Yes (static + K8s dynamic) | Yes (self-hosted runners) | Yes (registered runners) |
+| Config location | Agent labels in Jenkinsfile | `runs-on` in workflow YAML | `tags` in `.gitlab-ci.yml` |
+
+---
+
+## 8. How do you create multi-stage jobs in Jenkins?
+
+Multi-stage pipelines break a build into sequential or parallel stages — Build → Test → Security Scan → Push → Deploy. Each stage has a clear name, can fail independently, and the pipeline visualization shows exactly where a failure occurred.
+
+**Basic multi-stage pipeline:**
+
+```groovy
+pipeline {
+  agent { label 'docker-agent' }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Build') {
+      steps {
+        sh 'docker build -t myapp:$GIT_COMMIT .'
+      }
+    }
+
+    stage('Unit Tests') {
+      steps {
+        sh 'docker run --rm myapp:$GIT_COMMIT pytest tests/unit/'
+      }
+      post {
+        always {
+          junit 'test-results/*.xml'   // Publish test results regardless of pass/fail
+        }
+      }
+    }
+
+    stage('Security Scan') {
+      steps {
+        sh 'trivy image --exit-code 1 --severity HIGH,CRITICAL myapp:$GIT_COMMIT'
+      }
+    }
+
+    stage('Push to ECR') {
+      steps {
+        sh '''
+          aws ecr get-login-password | docker login --username AWS --password-stdin $ECR_REPO
+          docker push $ECR_REPO/myapp:$GIT_COMMIT
+        '''
+      }
+    }
+
+    stage('Deploy to Staging') {
+      steps {
+        sh 'helm upgrade --install myapp ./helm -f values/staging.yaml --set image.tag=$GIT_COMMIT'
+      }
+    }
+
+    stage('Deploy to Production') {
+      when { branch 'main' }   // Only run on main branch
+      steps {
+        input message: 'Approve production deployment?'
+        sh 'helm upgrade --install myapp ./helm -f values/prod.yaml --set image.tag=$GIT_COMMIT'
+      }
+    }
+  }
+
+  post {
+    failure {
+      slackSend channel: '#builds', message: "Build FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}"
+    }
+    success {
+      slackSend channel: '#builds', message: "Build PASSED: ${env.JOB_NAME} #${env.BUILD_NUMBER}"
+    }
+  }
+}
+```
+
+**Parallel stages — run independent stages simultaneously:**
+
+```groovy
+stage('Test + Scan in Parallel') {
+  parallel {
+    stage('Unit Tests') {
+      steps { sh 'pytest tests/unit/' }
+    }
+    stage('Integration Tests') {
+      steps { sh 'pytest tests/integration/' }
+    }
+    stage('Security Scan') {
+      steps { sh 'trivy image myapp:$GIT_COMMIT' }
+    }
+  }
+  // All three run simultaneously — total time = longest stage, not sum of all
+}
+```
+
+Running Unit Tests (2 min), Integration Tests (3 min), and Scan (1 min) in parallel takes 3 minutes instead of 6. This is the single biggest pipeline optimization available. The console output was visible to all engineers with Jenkins read access — 23 people. The access key was rotated within 10 minutes of discovery, but CloudTrail showed no unauthorized usage. After this: mandatory pipeline code review that checks for `echo` + credential variable patterns, and all credentials moved from Jenkins store to Secrets Manager with the IAM instance profile approach. No human can now see the actual secret values — not even Jenkins admins.

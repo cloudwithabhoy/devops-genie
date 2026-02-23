@@ -160,3 +160,149 @@ Your service returns 200 with correct-looking responses. But it's calling an ups
 Check distributed traces for the actual response bodies from dependencies, or add validation metrics: `orders_created_total` dropping while `checkout_requests_total` stays stable → checkout is completing but orders aren't being created.
 
 **The meta-lesson:** After every "logs fine, metrics fine, users unhappy" incident, I add the missing observability signal. Aggregate metrics → per-pod metrics. Internal health checks → external synthetic monitoring. Pod-level metrics → CDN/LB-level metrics. Over time, the blind spots shrink.
+
+---
+
+## 3. Grafana dashboard is responding slowly — how do you troubleshoot it?
+
+Slow Grafana dashboards have three possible root causes: expensive queries hitting Prometheus/datasource, Grafana's own resource constraints, or datasource performance degradation. You eliminate them in order.
+
+**Step 1: Identify which panel is slow using the browser.**
+
+Open the dashboard. Open browser DevTools → Network tab. Reload the dashboard. Look for slow requests — each panel fires its own query. The slowest request points to the expensive panel.
+
+In Grafana itself:
+
+```
+Dashboard → Query Inspector (click the panel → Inspect → Query)
+→ Shows: query sent to Prometheus, response time, data points returned
+```
+
+If a query returns 100,000+ data points with sub-second time ranges, that's the bottleneck.
+
+**Step 2: Check the Prometheus query performance.**
+
+Grafana is slow because Prometheus is slow evaluating the query, or returning too much data.
+
+```bash
+# Open Prometheus directly and test the query
+# http://prometheus:9090/graph → paste the query → run it
+# Check how long the query takes
+
+# Common slow query patterns:
+# 1. High cardinality — too many label combinations
+rate(http_requests_total[5m])   # If http_requests_total has 10,000 time series → slow
+
+# Fix: add label filters to reduce cardinality
+rate(http_requests_total{service="order-service", env="prod"}[5m])
+
+# 2. Range too wide
+increase(http_errors_total[30d])  # 30-day range = Prometheus reads 30 days of chunks → very slow
+
+# Fix: use recording rules for long-range queries
+# precompute the result and store it as a new metric
+```
+
+**Step 3: Add recording rules for expensive queries.**
+
+Recording rules precompute query results at scrape time so Grafana reads the result instantly instead of computing it on demand.
+
+```yaml
+# prometheus-recording-rules.yml
+groups:
+  - name: dashboard_precompute
+    interval: 1m    # Recompute every minute
+    rules:
+      # Precompute error rate per service
+      - record: job:http_error_rate:rate5m
+        expr: |
+          rate(http_requests_total{status=~"5.."}[5m])
+          /
+          rate(http_requests_total[5m])
+
+      # Precompute p99 latency per service
+      - record: job:http_request_duration_p99:rate5m
+        expr: histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))
+```
+
+In Grafana, replace the original slow query with the recording rule metric:
+
+```promql
+# Before (computed at query time — slow):
+histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))
+
+# After (pre-recorded — instant):
+job:http_request_duration_p99:rate5m
+```
+
+**Step 4: Check Grafana's own resource usage.**
+
+```bash
+# Check Grafana pod resources (if running in Kubernetes)
+kubectl top pod grafana-0 -n monitoring
+# CPU: 950m (near limit), Memory: 1.8Gi
+
+# Grafana is CPU-throttled or OOM — increase limits
+kubectl edit deployment grafana -n monitoring
+# resources:
+#   requests: { cpu: "500m", memory: "512Mi" }
+#   limits:   { cpu: "2000m", memory: "2Gi" }   ← increase these
+
+# Check Grafana's own logs for slow query warnings
+kubectl logs grafana-0 -n monitoring | grep -i "slow\|timeout\|warn"
+```
+
+**Step 5: Reduce dashboard complexity.**
+
+```
+Common dashboard anti-patterns that cause slowness:
+
+1. Too many panels on one dashboard (>20 panels all querying simultaneously)
+   Fix: split into multiple dashboards, use variables to filter scope
+
+2. Auto-refresh set to 5s on a heavy dashboard
+   Fix: set refresh to 1m or 5m — users rarely need sub-minute refresh
+
+3. Time range set to "Last 30 days" by default
+   Fix: default to "Last 1 hour" — use longer ranges only when investigating
+
+4. No use of $__interval variable (fixed intervals = Prometheus returns more data than Grafana can render)
+   Fix: use $__interval in rate() functions so Grafana adapts to the selected time range
+```
+
+```promql
+# Bad — fixed 5m interval regardless of dashboard time range
+rate(http_requests_total[5m])
+
+# Good — interval adapts to dashboard zoom level
+rate(http_requests_total[$__interval])
+```
+
+**Step 6: Check the datasource performance directly.**
+
+```bash
+# Test Prometheus response time directly (bypassing Grafana)
+curl -s -w "\nTime: %{time_total}s\n" \
+  "http://prometheus:9090/api/v1/query?query=up"
+
+# If Prometheus itself is slow: check its resources
+kubectl top pod prometheus-0 -n monitoring
+
+# Prometheus may need more memory (it caches chunks in RAM)
+# Or the TSDB may need compaction:
+# Prometheus UI → /tsdb-status → check cardinality
+
+# High cardinality = millions of unique time series = slow queries + high memory
+```
+
+**Diagnostic sequence:**
+
+```
+1. Browser DevTools → identify slowest panel/query
+2. Run that query directly in Prometheus UI → measure response time
+3. If Prometheus is slow → add recording rules or reduce cardinality
+4. If Prometheus is fast but Grafana is slow → check Grafana resources
+5. Reduce dashboard panels, increase refresh interval, use $__interval
+```
+
+**Real scenario:** Our main engineering dashboard had 28 panels and was taking 45 seconds to load. Query Inspector showed 3 panels were each running histogram_quantile over 30d ranges with no label filters — each query took 12–15 seconds in Prometheus. We added recording rules for the three expensive queries and added `env="prod"` label filters. Dashboard load time dropped to 3 seconds. We also split the dashboard into "Operations" (real-time, 1-hour default range) and "Weekly Review" (7-day default range) so engineers always opened the fast one first.

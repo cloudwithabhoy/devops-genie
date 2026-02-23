@@ -284,3 +284,160 @@ curl -v http://<target-ip>:<port>/health
 ```
 
 **Real scenario:** We had a production 502 that lasted 8 minutes. ALB console showed "Active" and listeners were configured correctly. The target group showed 3 healthy targets. But 502s persisted. The issue: a new deployment had added an HTTP → HTTPS redirect middleware. The ALB health check was on port 80 (HTTP). The middleware returned 301 to every request on port 80, including the health check. The ALB marked the targets as healthy (it accepted the 301 by default — we had `HttpCode: 200-301` in the matcher). But real user requests were also getting 301, and the ALB was configured for HTTP only — it couldn't follow the redirect. Fixed by: changing the ALB to terminate HTTPS and routing to port 80 on targets, removing the middleware redirect. 502s stopped immediately.
+
+---
+
+## 3. Application is deployed on AWS but not accessible from the browser — how do you debug it?
+
+"Not accessible from the browser" is vague — that's intentional. The interviewer wants to see a systematic elimination process, not a guess. The answer moves from the outermost layer (DNS/internet) inward (load balancer → EC2/EKS → application).
+
+**The layered debugging model:**
+
+```
+Browser → DNS → Internet → Security Group / NACL → Load Balancer → Target → Application
+```
+
+Each layer can be the failure point. You eliminate them in order.
+
+**Layer 1: Is it a DNS problem?**
+
+```bash
+# Does the domain resolve?
+nslookup api.myapp.com
+# Or:
+dig api.myapp.com +short
+
+# Expected: returns an IP or ALB CNAME
+# If no answer / NXDOMAIN → DNS record missing or propagating
+```
+
+If DNS doesn't resolve: check Route53 hosted zone → the record must exist and point at the right ALB/CloudFront/EC2 endpoint.
+
+```bash
+# Check Route53 directly (bypassing DNS cache)
+aws route53 list-resource-record-sets --hosted-zone-id <zone-id> \
+  --query "ResourceRecordSets[?Name=='api.myapp.com.']"
+```
+
+**Layer 2: Does the ALB/endpoint respond?**
+
+```bash
+# curl with verbose output — shows TLS handshake, redirects, response headers
+curl -v https://api.myapp.com/health
+
+# If the domain resolves but no connection:
+# → Security Group on ALB not allowing port 443 from 0.0.0.0/0
+# → ALB listener not configured for port 443
+# → NACL blocking inbound on port 443
+
+# Test HTTP separately (confirm whether it's HTTP or HTTPS config)
+curl -v http://api.myapp.com/health
+```
+
+**Check the ALB security group:**
+
+```bash
+aws ec2 describe-security-groups \
+  --group-ids <alb-security-group-id> \
+  --query 'SecurityGroups[*].IpPermissions'
+# Must see: inbound rule allowing port 443 (and 80) from 0.0.0.0/0
+```
+
+**Layer 3: Are the ALB targets healthy?**
+
+The ALB could be reachable but returning 502/503 because all targets are unhealthy.
+
+```bash
+# Check target group health
+aws elbv2 describe-target-health \
+  --target-group-arn <target-group-arn>
+
+# Look for:
+# "State": "unhealthy"
+# "Reason": "Target.HealthCheckFailed" or "Target.NotRegistered"
+```
+
+Common reasons targets are unhealthy:
+- **Health check path is wrong** — app is running but `/health` returns 404
+- **Security group on target doesn't allow traffic from ALB** — ALB's security group must be in the inbound rules of the target's security group
+- **Port mismatch** — ALB forwards to port 8080 but app listens on 3000
+- **App is starting up** — pods/instances in initializing state fail health checks until ready
+
+```bash
+# Verify the target security group allows traffic from the ALB SG
+aws ec2 describe-security-groups --group-ids <target-sg-id> \
+  --query 'SecurityGroups[*].IpPermissions'
+# Must see: inbound rule on app port (e.g., 8080) from ALB security group ID
+```
+
+**Layer 4: Is the application running on the target?**
+
+If the ALB can't reach the target, test the target directly (from another instance in the same VPC):
+
+```bash
+# From a bastion host or another EC2 in the same VPC:
+curl -v http://<target-private-ip>:8080/health
+
+# If this fails:
+# "Connection refused" → app is not running on that port
+# "Connection timed out" → security group blocking or app crashed
+
+# Check what's actually listening on the instance:
+ssh ec2-user@<bastion-ip>
+ssh ec2-user@<target-private-ip>
+ss -tlnp | grep LISTEN   # What ports are open?
+```
+
+**Layer 5: Is HTTPS configured correctly?**
+
+Browser shows "not secure" or ERR_SSL_PROTOCOL_ERROR:
+
+```bash
+# Check the ALB certificate
+aws elbv2 describe-listeners --load-balancer-arn <alb-arn> \
+  --query 'Listeners[?Protocol==`HTTPS`].Certificates'
+
+# Verify certificate is valid and not expired
+aws acm describe-certificate --certificate-arn <cert-arn> \
+  --query 'Certificate.{Status:Status,Expiry:NotAfter,Domain:DomainName}'
+# Status must be "ISSUED", Expiry must be in the future
+```
+
+If certificate status is `PENDING_VALIDATION`: the DNS validation record was never added to Route53.
+
+**Layer 6: Is there a WAF or CloudFront blocking the request?**
+
+If you're behind CloudFront + WAF:
+
+```bash
+# Check CloudFront distribution — is the origin correct?
+aws cloudfront get-distribution --id <distribution-id> \
+  --query 'Distribution.DistributionConfig.Origins'
+
+# Check WAF — is a rule blocking legitimate traffic?
+# WAF → Web ACLs → Sampled Requests → look for blocked requests with rule reason
+```
+
+**The 5-minute diagnostic sequence:**
+
+```bash
+# 1. DNS resolves?
+dig api.myapp.com +short
+
+# 2. Port open?
+nc -zv api.myapp.com 443
+
+# 3. HTTP response?
+curl -v https://api.myapp.com/health
+
+# 4. ALB targets healthy?
+aws elbv2 describe-target-health --target-group-arn <arn>
+
+# 5. ALB SG allows inbound 443?
+aws ec2 describe-security-groups --group-ids <alb-sg-id>
+
+# 6. Target SG allows traffic from ALB SG?
+aws ec2 describe-security-groups --group-ids <target-sg-id>
+```
+
+**Real scenario:** A new service was deployed and the browser showed "This site can't be reached." DNS resolved correctly — dig returned the ALB CNAME. curl to the ALB returned a connection timeout. The ALB listener was configured (port 443). The issue: the engineer had created a new target group and attached it to the ALB, but the target group used port 8080. The pod was listening on port 3000 (the Dockerfile's EXPOSE was 3000, but the Helm chart defaulted to 8080). The ALB was routing to port 8080 → connection refused from pods on port 3000 → ALB returned 502. Fix: updated the Helm chart's `service.targetPort` to 3000. Service was up in 2 minutes.

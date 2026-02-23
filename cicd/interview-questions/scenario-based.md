@@ -332,3 +332,141 @@ For widespread deployment failures specifically, the postmortem should ask:
 - Was there a deployment freeze for high-risk changes?
 - Do we have canary deployments for this service to limit blast radius?
 - Can we make this change backward-compatible so rollback is safer?
+
+---
+
+## 7. You have an `index.html` in a GitHub repository. The requirement is to deploy it to AWS behind a load balancer, using the repository's username and token. How do you achieve this?
+
+This is a common beginner scenario that combines GitHub (source), a CI/CD pipeline (automation), AWS EC2 (server), and an ALB (load balancer). The answer walks through each component.
+
+**Architecture:**
+
+```
+GitHub repo (index.html)
+    ↓ push trigger
+GitHub Actions (CI/CD pipeline)
+    ↓ SSH or AWS CLI
+EC2 Instance (Apache/Nginx serving index.html)
+    ↓
+ALB (Application Load Balancer)
+    ↓
+User's browser
+```
+
+**Step 1: AWS infrastructure — EC2 + ALB.**
+
+```
+VPC
+└── Public Subnet
+    ├── EC2 instance (Apache installed, port 80)
+    └── ALB (listener port 80 → Target Group → EC2)
+```
+
+The EC2 instance runs Apache (or Nginx) and serves files from `/var/www/html/`. The ALB sits in front and distributes traffic.
+
+**Step 2: Set up Apache on the EC2 instance.**
+
+```bash
+# On the EC2 instance (Amazon Linux 2 / Ubuntu)
+sudo apt update && sudo apt install apache2 -y   # Ubuntu
+# or
+sudo yum install httpd -y && sudo systemctl start httpd   # Amazon Linux
+
+# Web root — this is where index.html must live
+/var/www/html/
+```
+
+**Step 3: Store credentials as GitHub Secrets.**
+
+In your GitHub repository:
+
+```
+Settings → Secrets and variables → Actions → New repository secret
+
+EC2_HOST      = <EC2 public IP or DNS>
+EC2_USER      = ubuntu   (or ec2-user for Amazon Linux)
+EC2_SSH_KEY   = <contents of the .pem private key file>
+```
+
+You do NOT store GitHub username/token in the repo itself — you use GitHub Secrets for all sensitive values. The token mentioned in the question is used to authenticate GitHub Actions access to the repository if it's private.
+
+**Step 4: GitHub Actions workflow.**
+
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy index.html to AWS EC2
+
+on:
+  push:
+    branches: [main]   # Trigger on push to main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Check out the code (uses GITHUB_TOKEN automatically for public/same repo)
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        # For a private repo accessed by another service, you'd use:
+        # with:
+        #   token: ${{ secrets.GH_PAT }}
+
+      # 2. Copy index.html to EC2 via SCP
+      - name: Deploy index.html via SCP
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "index.html"
+          target: "/var/www/html/"
+
+      # 3. Restart Apache to ensure it's serving the latest file
+      - name: Restart Apache
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            sudo systemctl restart apache2
+            echo "Deployment complete. index.html served from /var/www/html/"
+```
+
+**Alternative: pull from GitHub directly on the EC2 instance (using username + token).**
+
+If you want the EC2 instance to `git pull` the repo itself (rather than CI pushing files to it):
+
+```yaml
+- name: SSH and pull latest from GitHub
+  uses: appleboy/ssh-action@v1.0.3
+  with:
+    host: ${{ secrets.EC2_HOST }}
+    username: ${{ secrets.EC2_USER }}
+    key: ${{ secrets.EC2_SSH_KEY }}
+    script: |
+      cd /var/www/html
+      # Pull using GitHub username and token embedded in URL
+      git pull https://${{ secrets.GH_USERNAME }}:${{ secrets.GH_TOKEN }}@github.com/org/repo.git main
+      sudo systemctl reload apache2
+```
+
+**Step 5: ALB Health Check.**
+
+The ALB Target Group needs a health check path. Since you're serving `index.html`, configure:
+
+```
+Health check path: /index.html  (or just /)
+Health check port: 80
+Expected response: 200
+```
+
+The EC2 instance is healthy → ALB routes traffic to it → users access `http://<ALB-DNS>/` and see `index.html`.
+
+**What the username and token are used for:**
+
+- **GitHub username** — identifies who is making the API/Git request
+- **GitHub token (PAT)** — authenticates the request (replaces password). Used when the repository is private, when the EC2 does a `git pull` on startup, or when a script clones the repo. In GitHub Actions itself, `GITHUB_TOKEN` is auto-provided for same-repo operations — you only need a PAT for cross-repo access or external scripts.
+
+**Security note:** Never hardcode the token in the workflow YAML or in scripts committed to the repo. Always store it in GitHub Secrets or AWS Secrets Manager.

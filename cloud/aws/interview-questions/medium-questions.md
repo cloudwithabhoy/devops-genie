@@ -715,3 +715,410 @@ Exceptions:
 ```
 
 **Real cost comparison:** Before consolidating, we had 6 ALBs (one per service) and 1 NLB. After: 1 ALB for HTTP services (path routing) + 1 NLB for TCP services. Saved $180/month in load balancer hourly charges. More importantly, WAF was only on 1 ALB instead of 6 — one rule update protects all services.
+
+---
+
+## 10. What is AWS Auto Scaling Groups and what are its use cases?
+
+An Auto Scaling Group (ASG) is AWS's mechanism for automatically adjusting the number of EC2 instances in a group based on demand, schedules, or metrics. The ASG ensures you always have the right number of instances — not too few (degraded availability) and not too many (wasted cost).
+
+**The core model:**
+
+```
+ASG Configuration
+├── Launch Template  — which AMI, instance type, IAM role, user-data, security group
+├── VPC + Subnets    — which AZs to spread instances across
+├── Min / Desired / Max size  — floor, current target, ceiling
+└── Scaling Policies — what triggers adding or removing instances
+```
+
+The ASG continuously checks: are the running instances equal to the desired count? If an instance fails a health check, the ASG terminates it and launches a replacement automatically — this is self-healing.
+
+**Scaling policies:**
+
+**1. Target Tracking (simplest — 80% of use cases).**
+
+Tell the ASG to maintain a target metric value. It figures out when to add/remove.
+
+```hcl
+resource "aws_autoscaling_policy" "cpu_tracking" {
+  name                   = "cpu-target-tracking"
+  autoscaling_group_name = aws_autoscaling_group.app.name
+  policy_type            = "TargetTrackingScaling"
+
+  target_tracking_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ASGAverageCPUUtilization"
+    }
+    target_value = 70.0   # Keep average CPU at 70%
+    # ASG adds instances when CPU > 70%, removes when CPU < 70%
+  }
+}
+```
+
+Other common targets: `ALBRequestCountPerTarget` (requests per instance), `ASGAverageNetworkIn`.
+
+**2. Step Scaling (when you need tiered responses).**
+
+Different scale amounts at different thresholds — add 2 instances at 70% CPU, add 5 at 90% CPU.
+
+**3. Scheduled Scaling (predictable traffic patterns).**
+
+```hcl
+resource "aws_autoscaling_schedule" "morning_scale_up" {
+  scheduled_action_name  = "morning-scale-up"
+  autoscaling_group_name = aws_autoscaling_group.app.name
+  min_size               = 4
+  max_size               = 20
+  desired_capacity       = 8
+  recurrence             = "0 8 * * 1-5"   # 8 AM weekdays (IST)
+}
+
+resource "aws_autoscaling_schedule" "night_scale_down" {
+  scheduled_action_name  = "night-scale-down"
+  autoscaling_group_name = aws_autoscaling_group.app.name
+  min_size               = 1
+  max_size               = 20
+  desired_capacity       = 2
+  recurrence             = "0 20 * * 1-5"  # 8 PM weekdays — save cost overnight
+}
+```
+
+**Use cases:**
+
+**1. Stateless application tiers — the primary use case.**
+
+Web servers, API servers, worker processes — anything that doesn't store state locally. Put them in an ASG behind an ALB. Traffic spikes: ASG scales out. Traffic drops: scales in. Instance fails: replaced automatically. This is the foundation of every resilient EC2 architecture.
+
+**2. Cost optimization with mixed instances + spot.**
+
+```hcl
+resource "aws_autoscaling_group" "app" {
+  mixed_instances_policy {
+    launch_template {
+      launch_template_specification {
+        launch_template_id = aws_launch_template.app.id
+      }
+      override {
+        instance_type     = "m5.large"
+        weighted_capacity = "1"
+      }
+      override {
+        instance_type     = "m5a.large"    # AMD variant — often 10% cheaper
+        weighted_capacity = "1"
+      }
+      override {
+        instance_type     = "m6i.large"
+        weighted_capacity = "1"
+      }
+    }
+    instances_distribution {
+      on_demand_base_capacity                  = 2    # Always keep 2 on-demand (baseline)
+      on_demand_percentage_above_base_capacity = 20   # 20% on-demand, 80% spot above base
+      spot_allocation_strategy                 = "price-capacity-optimized"
+    }
+  }
+}
+```
+
+This runs your baseline on reliable on-demand instances and scales with cheap spot instances — typically 60–70% cheaper than on-demand for the spot portion.
+
+**3. Self-healing infrastructure.**
+
+ASG integrates with EC2 health checks and ALB health checks. If an instance starts failing health checks:
+1. ASG marks it unhealthy
+2. Terminates the failing instance
+3. Launches a replacement in the same AZ
+4. ALB drains connections before termination (connection draining / deregistration delay)
+
+No manual intervention. Our on-call engineers stopped getting paged for "dead instance — please replace" alerts after we moved to ASGs.
+
+**4. Multi-AZ high availability.**
+
+```hcl
+resource "aws_autoscaling_group" "app" {
+  vpc_zone_identifier = [
+    aws_subnet.private_a.id,  # ap-south-1a
+    aws_subnet.private_b.id,  # ap-south-1b
+    aws_subnet.private_c.id,  # ap-south-1c
+  ]
+  # ASG spreads instances across AZs
+  # If one AZ has an outage, ASG launches replacements in other AZs
+}
+```
+
+**ASG lifecycle hooks — for graceful operations:**
+
+```hcl
+resource "aws_autoscaling_lifecycle_hook" "terminating" {
+  name                   = "drain-before-termination"
+  autoscaling_group_name = aws_autoscaling_group.app.name
+  lifecycle_transition   = "autoscaling:EC2_INSTANCE_TERMINATING"
+  heartbeat_timeout      = 300   # 5 minutes to complete in-flight requests
+  default_result         = "CONTINUE"
+}
+```
+
+Before terminating an instance during scale-in, the lifecycle hook pauses and waits — giving the instance 5 minutes to finish processing any in-flight requests. Critical for worker processes that shouldn't be killed mid-job.
+
+**Real scenario:** Our batch processing workers ran on a fixed fleet of 10 EC2 instances. During month-end reporting, the queue had 50,000 jobs and 10 workers took 8 hours. We moved to an ASG scaling on SQS queue depth: 0 messages → 1 instance (cost: ~$0.10/hour). Queue depth > 1,000 → scale to 20 instances. Month-end processing finished in 40 minutes instead of 8 hours. Cost for that burst: $6 instead of running 10 instances 24/7 at $48/day.
+
+---
+
+## 11. Why do we use RDS and how do you scale it?
+
+RDS (Relational Database Service) is AWS's managed database offering. The question has two parts — "why" (when to choose RDS over alternatives) and "how to scale" (the actual operational work).
+
+**Why RDS over self-managed databases on EC2:**
+
+Running PostgreSQL on an EC2 instance means you own: installation, patching, backups, replication setup, failover handling, monitoring, storage management, SSL certificate rotation. That's a full-time job per database cluster.
+
+RDS manages all of that:
+
+| Concern | EC2 self-managed | RDS managed |
+|---|---|---|
+| Patches | You apply them | AWS applies them (with maintenance windows) |
+| Backups | You set up cron + S3 | Automated daily backups, point-in-time recovery |
+| Multi-AZ failover | You configure replication + Route53 | One checkbox — automatic failover < 60 seconds |
+| Monitoring | You set up Prometheus exporters | CloudWatch metrics out of the box |
+| Storage | You provision and resize volumes | Autoscaling storage (no manual resize) |
+| Read replicas | You configure streaming replication | One API call, AWS manages lag monitoring |
+
+The tradeoff: RDS costs ~20–40% more than equivalent EC2 compute. That premium buys engineering time. For a 3-person team running 5 databases, the math is obvious — the alternative is one engineer spending 30% of their time on database operations.
+
+**When NOT to use RDS:**
+
+- **Need unsupported extensions or custom compiled PostgreSQL** — RDS restricts superuser and some extensions
+- **Extreme performance requirements** — self-managed on `i3en.metal` with NVMe may outperform RDS for specific workloads
+- **Cost at massive scale** — very large RDS instances are expensive; at scale, Aurora Serverless or self-managed may win
+- **Non-relational workloads** — use DynamoDB (key-value), ElastiCache (caching), OpenSearch (search) instead
+
+**How to scale RDS:**
+
+**Vertical scaling (scale up — bigger instance).**
+
+```bash
+# Modify the instance class — takes 5–10 minutes with a reboot
+aws rds modify-db-instance \
+  --db-instance-identifier prod-postgres \
+  --db-instance-class db.r6g.2xlarge \   # Was db.r6g.xlarge
+  --apply-immediately
+```
+
+In Terraform:
+```hcl
+resource "aws_db_instance" "prod" {
+  instance_class = "db.r6g.2xlarge"   # Change here, terraform apply triggers modification
+}
+```
+
+Vertical scaling handles CPU and memory constraints but has limits — the largest RDS instance is `db.r6g.16xlarge` (64 vCPU, 512 GB RAM). Beyond that: Aurora.
+
+**Horizontal scaling for reads — read replicas.**
+
+```hcl
+resource "aws_db_instance" "prod_replica_1" {
+  replicate_source_db = aws_db_instance.prod.identifier
+  instance_class      = "db.r6g.xlarge"
+  publicly_accessible = false
+
+  tags = { Role = "read-replica" }
+}
+```
+
+Application code routes read queries to replica endpoints, writes to primary:
+
+```python
+# Application reads from replica — reduces load on primary
+db_read  = connect(host=os.getenv("DB_READ_ENDPOINT"))   # replica
+db_write = connect(host=os.getenv("DB_WRITE_ENDPOINT"))  # primary
+
+def get_orders(user_id):
+    return db_read.execute("SELECT * FROM orders WHERE user_id = %s", user_id)
+
+def create_order(data):
+    return db_write.execute("INSERT INTO orders ...", data)
+```
+
+Read replicas have **replication lag** — reads might be slightly behind writes. Acceptable for report queries, not acceptable for "immediately after write" reads (use primary for those).
+
+**Aurora for higher scale:**
+
+Aurora is AWS's cloud-native MySQL/PostgreSQL-compatible database. For large-scale workloads, it replaces standard RDS:
+
+- **Storage scales automatically** up to 128 TB (no manual intervention)
+- **Up to 15 read replicas** vs RDS's 5, with sub-10ms replication lag
+- **Aurora Serverless v2** — capacity auto-scales from 0.5 ACUs to 128 ACUs, billed per second. Zero-scale when idle (dev/test environments: near-zero cost when unused)
+
+```hcl
+resource "aws_rds_cluster" "prod" {
+  cluster_identifier = "prod-aurora-postgres"
+  engine             = "aurora-postgresql"
+  engine_version     = "15.4"
+
+  serverlessv2_scaling_configuration {
+    min_capacity = 0.5
+    max_capacity = 64
+  }
+}
+```
+
+**Storage scaling:**
+
+```hcl
+resource "aws_db_instance" "prod" {
+  allocated_storage     = 100    # GB initial
+  max_allocated_storage = 1000   # GB — autoscaling ceiling
+  # RDS automatically expands when free storage < 10%
+  # No downtime, no manual action required
+}
+```
+
+**Real scenario:** Our prod PostgreSQL (db.r6g.xlarge) was hitting 90% CPU during peak hours — report queries were competing with application writes. Solution: promoted one read replica for reporting and pointed our BI tool's connection string at the replica endpoint. Primary CPU dropped to 45%. Cost: +$0.20/hour for the replica instance. Alternative was a vertical scale to `db.r6g.2xlarge` (+$0.40/hour) which wouldn't have helped because the CPU was split between reads and writes — only separation fixed it.
+
+---
+
+## 12. How does Lambda establish communication with S3, and what are the common patterns?
+
+Lambda and S3 integrate in two directions: Lambda **triggered by** S3 events, and Lambda **reading from / writing to** S3 directly. Both patterns are common, and the interviewer often wants to see that you understand the IAM and network dimensions, not just the happy path.
+
+**Direction 1: S3 triggers Lambda (event-driven).**
+
+An S3 event notification calls Lambda automatically when objects are created, deleted, or modified.
+
+```hcl
+# 1. Lambda function
+resource "aws_lambda_function" "image_processor" {
+  function_name = "image-processor"
+  role          = aws_iam_role.lambda_exec.arn
+  handler       = "index.handler"
+  runtime       = "python3.12"
+  filename      = "function.zip"
+
+  environment {
+    variables = {
+      OUTPUT_BUCKET = aws_s3_bucket.processed.id
+    }
+  }
+}
+
+# 2. Allow S3 to invoke this Lambda
+resource "aws_lambda_permission" "s3_invoke" {
+  statement_id  = "AllowS3Invoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.image_processor.function_name
+  principal     = "s3.amazonaws.com"
+  source_arn    = aws_s3_bucket.uploads.arn
+}
+
+# 3. S3 notification that triggers the Lambda
+resource "aws_s3_bucket_notification" "upload_trigger" {
+  bucket = aws_s3_bucket.uploads.id
+
+  lambda_function {
+    lambda_function_arn = aws_lambda_function.image_processor.arn
+    events              = ["s3:ObjectCreated:*"]
+    filter_prefix       = "uploads/"     # Only trigger for objects in uploads/ prefix
+    filter_suffix       = ".jpg"         # Only for JPEG files
+  }
+
+  depends_on = [aws_lambda_permission.s3_invoke]
+}
+```
+
+Lambda receives the S3 event and processes it:
+
+```python
+import boto3
+import json
+
+s3 = boto3.client('s3')
+
+def handler(event, context):
+    for record in event['Records']:
+        bucket = record['s3']['bucket']['name']
+        key    = record['s3']['object']['key']
+
+        # Download the uploaded file
+        response = s3.get_object(Bucket=bucket, Key=key)
+        image_data = response['Body'].read()
+
+        # Process (resize, generate thumbnail, etc.)
+        thumbnail = generate_thumbnail(image_data)
+
+        # Upload result to output bucket
+        s3.put_object(
+            Bucket=os.environ['OUTPUT_BUCKET'],
+            Key=f"thumbnails/{key}",
+            Body=thumbnail,
+            ContentType='image/jpeg'
+        )
+```
+
+**Direction 2: Lambda calls S3 directly (IAM-controlled).**
+
+Lambda uses the AWS SDK to read/write S3. The only requirement: the Lambda execution role must have the necessary S3 permissions.
+
+```hcl
+# Lambda execution role with S3 access
+resource "aws_iam_role_policy" "lambda_s3_access" {
+  name = "lambda-s3-access"
+  role = aws_iam_role.lambda_exec.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:PutObject"]
+        Resource = "${aws_s3_bucket.data.arn}/*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket"]
+        Resource = aws_s3_bucket.data.arn
+      }
+    ]
+  })
+}
+```
+
+No access keys needed — Lambda automatically uses the execution role's credentials via the instance metadata service.
+
+**Network consideration: VPC Lambdas need a VPC endpoint or NAT Gateway to reach S3.**
+
+Lambda functions NOT in a VPC reach S3 directly over the internet (via AWS's internal network).
+
+Lambda functions IN a VPC (needed to access RDS, ElastiCache) cannot reach S3 by default — the VPC's private subnets have no internet route. Two options:
+
+```hcl
+# Option 1: VPC Gateway Endpoint for S3 (free, recommended)
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = aws_vpc.main.id
+  service_name      = "com.amazonaws.ap-south-1.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = [aws_route_table.private.id]
+  # S3 traffic from the VPC now routes via this endpoint, not NAT Gateway
+}
+
+# Option 2: NAT Gateway (costs money per GB processed)
+# Everything in private subnets routes internet-bound traffic through NAT
+```
+
+Gateway endpoints are free and add a route to the VPC's route table. Every S3 request from a VPC Lambda goes through the endpoint instead of NAT — eliminating NAT Gateway data processing charges for S3 traffic.
+
+**Common patterns:**
+
+| Pattern | Trigger direction | Use case |
+|---|---|---|
+| S3 → Lambda | S3 event → Lambda | File processing on upload (images, CSVs, videos) |
+| Lambda → S3 (write) | Lambda invoked by other event | Store results, generate reports, write logs |
+| Lambda → S3 (read) | Lambda invoked by other event | Load config files, process reference data |
+| S3 → SQS → Lambda | S3 event → SQS → Lambda | High-volume file processing with backpressure |
+
+The S3 → SQS → Lambda pattern is preferred over direct S3 → Lambda for high-volume scenarios because:
+- SQS provides a buffer — Lambda can process at its own pace
+- SQS provides retry logic — failed Lambda invocations go back to the queue
+- S3 can deliver to SQS with guaranteed delivery; direct S3 → Lambda has a small chance of missed events at high volume
+
+**Real scenario:** We had a data pipeline where clients upload CSV files to S3. Direct S3 → Lambda worked fine at low volume. When a client uploaded 10,000 files in a batch, Lambda hit the concurrency limit (1,000 concurrent executions by default) and S3 events were throttled — some files never got processed. We moved to S3 → SQS → Lambda with a concurrency limit on the Lambda of 100. The SQS queue absorbed all 10,000 file events. Lambda processed them at 100 concurrent executions. No files were missed. Processing time: ~10 minutes instead of near-instant, which was acceptable for this batch pipeline.
