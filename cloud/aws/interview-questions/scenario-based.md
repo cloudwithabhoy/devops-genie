@@ -1272,3 +1272,101 @@ jobs:
 The `environment: production` setting in GitHub Actions requires a human reviewer to approve the prod deployment. The canary routing (10% to new version) catches issues before full rollout — Lambda alias weighted routing makes this trivial.
 
 **Real scenario:** A team was deploying Lambda functions manually — updating the function code directly in the prod account from a developer laptop. No versioning, no aliases, no approval gate. One deploy pushed dev debug code to prod (logging full request bodies including payment data to CloudWatch). After migrating to the alias + separate accounts pattern with GitHub Actions: dev code cannot reach prod because the GitHub Actions OIDC role for dev has no permissions in the prod account. Every prod deploy requires a PR merged to main + a manual approval in GitHub. Aliases let us roll back instantly to the previous version without a new deploy.
+
+---
+
+## 10. What errors have you faced while deploying in AWS using CodeDeploy?
+
+CodeDeploy failures are frustrating because the error messages are often vague. Here are the real errors we've hit and how we fixed each one.
+
+**Error 1: "The deployment failed because no instances were found for your deployment group."**
+
+```
+Deployment failed: No instances matched the tag filters in the deployment group.
+```
+
+Root cause: The EC2 instances don't have the right tags, or the CodeDeploy agent isn't installed/running.
+
+```bash
+# Check if the CodeDeploy agent is running on the instance
+sudo service codedeploy-agent status
+
+# Check if the instance has the correct tags
+aws ec2 describe-instances --instance-ids i-0abc123 \
+  --query 'Reservations[*].Instances[*].Tags'
+# Must match the deployment group's tag filter
+```
+
+Fix: Install the CodeDeploy agent (it's not pre-installed on most AMIs) and ensure tags match.
+
+**Error 2: "Script at specified location: scripts/start_server.sh is not executable."**
+
+```
+LifecycleEvent - AfterInstall
+Script - scripts/start_server.sh
+[stderr] Permission denied
+```
+
+Root cause: The script doesn't have execute permissions in the Git repo.
+
+```bash
+# Fix: add execute permission before committing
+chmod +x scripts/start_server.sh
+git add scripts/start_server.sh
+git commit -m "fix: add execute permission to deploy scripts"
+```
+
+Or add `runas: root` in `appspec.yml` — but fixing permissions is the right answer.
+
+**Error 3: "The overall deployment failed because too many individual instances failed deployment."**
+
+CodeDeploy deploys to instances in order. If the `ValidateService` hook fails on enough instances (based on your minimum healthy percentage), it stops the entire deployment.
+
+```bash
+# Check which lifecycle hook failed
+aws deploy get-deployment --deployment-id d-ABC123 \
+  --query 'deploymentInfo.deploymentOverview'
+
+# Check the instance-level error
+aws deploy get-deployment-instance --deployment-id d-ABC123 --instance-id i-0abc123
+```
+
+Common causes: health check URL is wrong, app startup takes longer than the timeout, port conflict.
+
+**Error 4: "The CodeDeploy agent did not find an AppSpec file."**
+
+The `appspec.yml` must be in the **root** of the deployment artifact (ZIP or S3 bundle). If it's in a subdirectory, CodeDeploy can't find it.
+
+**Error 5: Blue/Green deployment stuck — "Replacement instances failed to register with the load balancer."**
+
+```
+Deployment stuck at: BlockTraffic or AllowTraffic
+```
+
+Root cause: The new instances' security group doesn't allow health check traffic from the ALB. Or the health check path returns non-200.
+
+```bash
+# Check ALB target group health
+aws elbv2 describe-target-health --target-group-arn arn:aws:elasticloadbalancing:...
+# Targets showing "unhealthy" = health check failing
+
+# Common fix: ensure security group allows inbound from ALB on the app port
+```
+
+**Error 6: ECS CodeDeploy — "The ECS service is unable to reach a steady state."**
+
+CodeDeploy waits for the ECS service to stabilize (all tasks healthy). If the new task definition has a bug (bad image, missing env var, wrong port), the tasks fail health checks and the deployment times out after 60 minutes.
+
+```bash
+# Check the ECS task's stopped reason
+aws ecs describe-tasks --cluster my-cluster --tasks <task-arn> \
+  --query 'tasks[*].stoppedReason'
+
+# Common findings:
+# "Essential container exited" → app is crashing (check logs)
+# "CannotPullContainerError" → image doesn't exist in ECR
+# "ResourceNotFoundException" → Secrets Manager secret not found
+```
+
+**Real scenario:** We had a CodeDeploy Blue/Green deployment that was stuck for 45 minutes at "AllowTraffic." New instances were registered with the ALB but showing unhealthy. The health check path was `/health` but the new version changed it to `/api/health` in the code. The `appspec.yml` health check still pointed to `/health` — which returned 404. CodeDeploy waited for healthy targets, they never became healthy, and the deployment eventually timed out and rolled back. Fix: always update the ALB health check path AND the CodeDeploy lifecycle health check in the same PR as the application change.
+

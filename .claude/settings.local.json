@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"/mnt/c/Users/91740/Documents/cloudwithabhoy/devops-genie/docker/interview-questions/basic-questions.md\":*)",
+      "Bash(\"/mnt/c/Users/91740/Documents/cloudwithabhoy/devops-genie/iac/terraform/interview-questions/medium-questions.md\":*)",
+      "Bash(\"/mnt/c/Users/91740/Documents/cloudwithabhoy/devops-genie/cicd/jenkins/interview-questions/medium-questions.md\":*)",
+      "Bash(python3:*)"
+    ]
+  }
+}

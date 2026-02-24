@@ -594,3 +594,155 @@ routes:
 ```
 
 **Our stack:** Prometheus (metrics) + Alertmanager (routing) + Grafana (dashboards) + PagerDuty (on-call rotation) + Loki (logs) + Tempo (traces).
+
+---
+
+## 9. Which logs would you check if a user can't access your application?
+
+"User can't access" is vague — it could be DNS, network, load balancer, application, or database. You debug by following the request path from the user's browser to the backend, checking logs at each hop until you find where it breaks.
+
+**The request path and where to check:**
+
+```
+User → DNS → CDN/CloudFront → WAF → ALB → Kubernetes Ingress → Pod → Database
+  ↑        ↑         ↑          ↑     ↑          ↑            ↑        ↑
+ Browser  Route53  CF logs   WAF logs ALB logs  Ingress logs App logs  DB logs
+```
+
+**Layer 1 — Is the user reaching your infrastructure at all?**
+
+```bash
+# Check if DNS resolves correctly
+nslookup api.yourapp.com
+dig api.yourapp.com +short
+
+# Check CloudFront access logs (if using CDN)
+# CloudFront logs are delivered to S3
+aws s3 ls s3://cloudfront-logs-bucket/E1234567890/ --recursive | tail -5
+# Look for the user's IP, the status code returned, and the x-edge-result-type
+# "Error" result type = CloudFront couldn't reach your origin
+```
+
+If DNS doesn't resolve → Route53 issue (hosted zone misconfigured, domain expired, health check failing).
+If CloudFront returns an error → origin (ALB) is unreachable or returning errors.
+
+**Layer 2 — Is WAF blocking the request?**
+
+```bash
+# Check WAF sampled requests for blocks in the last hour
+aws wafv2 get-sampled-requests \
+  --web-acl-arn arn:aws:wafv2:ap-south-1:123456:regional/webacl/prod-waf/xxx \
+  --rule-metric-name BlockedRequests \
+  --scope REGIONAL \
+  --time-window StartTime=$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ),EndTime=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+  --max-items 50
+
+# Look for the user's IP in blocked requests
+# Common WAF blocks: rate limiting, geo-restriction, SQL injection false positive
+```
+
+**Layer 3 — ALB logs (is the load balancer receiving and forwarding the request?).**
+
+```bash
+# ALB access logs are delivered to S3
+# Fields: timestamp, client_ip, target_ip, request_url, elb_status_code, target_status_code
+
+# Search for the user's IP in ALB logs
+aws s3 cp s3://alb-logs-bucket/AWSLogs/123456/elasticloadbalancing/ap-south-1/2024/01/15/ /tmp/alb-logs/ --recursive
+zcat /tmp/alb-logs/*.gz | grep "203.0.113.45"
+
+# Key fields to check:
+# elb_status_code=502 → ALB received the request but backend returned error
+# elb_status_code=503 → no healthy targets (all pods are down)
+# elb_status_code=504 → backend timed out (pod is alive but not responding in time)
+# target_status_code=- → ALB couldn't connect to a target at all
+```
+
+**Layer 4 — Kubernetes Ingress Controller logs.**
+
+```bash
+# NGINX Ingress Controller logs
+kubectl logs -n ingress-nginx -l app.kubernetes.io/name=ingress-nginx --tail=200
+
+# Look for:
+# 502 = upstream returned error
+# 503 = no upstream available (service has no endpoints / pods)
+# 504 = upstream timeout
+
+# Check if the Ingress resource exists and points to the right service
+kubectl get ingress -n prod
+kubectl describe ingress my-app-ingress -n prod
+# Is the backend service/port correct? Is the host/path matching?
+```
+
+**Layer 5 — Application logs (the most common place to find the answer).**
+
+```bash
+# Pod logs — the first place most issues are resolved
+kubectl logs -n prod -l app=order-service --tail=200
+
+# Search for errors around the time the user reported the issue
+kubectl logs -n prod -l app=order-service --since=30m | grep -i "error\|exception\|panic\|fatal"
+
+# If pods are crash-looping, check the previous container's logs
+kubectl logs -n prod <pod-name> --previous
+
+# Check pod health and restarts
+kubectl get pods -n prod -l app=order-service
+# RESTARTS column > 0 means pods are crashing and restarting
+
+# Check events for scheduling or resource issues
+kubectl get events -n prod --sort-by='.lastTimestamp' | tail -20
+# Look for: FailedScheduling, OOMKilled, Liveness probe failed, Readiness probe failed
+```
+
+**Layer 6 — Database and downstream service logs.**
+
+```bash
+# If app logs show "connection refused" or "timeout" to the database
+# Check RDS events
+aws rds describe-events --source-type db-instance --duration 60
+# Look for: failover events, maintenance windows, storage full
+
+# Check RDS CloudWatch metrics
+# CPUUtilization > 90%, DatabaseConnections near max, FreeStorageSpace = 0
+# Any of these can cause the app to fail
+
+# Check Redis/ElastiCache
+aws elasticache describe-events --duration 60
+```
+
+**Layer 7 — System-level logs (when the server itself is the problem).**
+
+```bash
+# On the Linux host (EC2 or EKS node)
+journalctl -u kubelet --since "30 minutes ago" | grep -i error
+dmesg | tail -50    # Kernel messages — disk errors, OOM kills, network issues
+
+# Common findings:
+# "Out of memory: Kill process" → OOMKiller killed your app
+# "I/O error" → disk failing
+# "nf_conntrack: table full" → connection tracking table exhausted (high traffic)
+```
+
+---
+
+**Quick investigation sequence:**
+
+```
+User can't access app
+   ↓
+1. DNS resolves?         → dig api.yourapp.com
+2. CloudFront/CDN ok?    → CloudFront access logs in S3
+3. WAF blocking?         → WAF sampled requests for user's IP
+4. ALB receiving?        → ALB access logs — check status codes
+5. Ingress routing?      → kubectl logs ingress-nginx
+6. Pods running?         → kubectl get pods (restarts? CrashLoopBackOff?)
+7. App errors?           → kubectl logs <pod> | grep ERROR
+8. Database reachable?   → RDS events, CloudWatch metrics
+```
+
+**Real scenario:** A user reported "site is down" at 3 PM. DNS was fine. CloudFront was fine. ALB logs showed `504 Gateway Timeout` for all requests. Ingress controller logs showed `upstream timed out (110: Connection timed out)`. Pod logs showed the app was running but every request was hanging at the database call. RDS CloudWatch showed `DatabaseConnections = 150` (max was 150). Root cause: a background job had a connection leak — it opened connections without closing them. Over 4 hours it exhausted the pool. Fix: killed the leaking job, connections freed up, app recovered in 30 seconds. Prevention: added a CloudWatch alarm on `DatabaseConnections > 120` and fixed the connection leak in the background job.
+
+> **Also asked as:** "Your application isn't responding — walk me through your debugging process" — use the same layer-by-layer approach above, starting from the outside (DNS/CDN/LB) and working inward (app/DB).
+

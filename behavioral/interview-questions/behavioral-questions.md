@@ -122,3 +122,37 @@ We use Argo Rollouts for canary deployments on critical services. 5% of traffic 
 - New feature with schema change → Blue/Green
 - High-risk feature impacting checkout or payments → Canary
 - Hotfix → Rolling Update with shortened validation window"
+
+---
+
+## 4. Tell me about yourself.
+
+This is not a biography. It's a **90-second pitch** structured as: who you are → what you do → what makes you relevant to this role.
+
+**The framework: Present → Past → Future.**
+
+```
+Present:  What you're doing now (role, company, tech stack)
+Past:     Key experience that's relevant (1-2 highlights)
+Future:   Why you're here (what excites you about this role)
+```
+
+**Example (customize with your details):**
+
+"I'm currently working as a DevOps Engineer at [Company], where I manage the infrastructure for a microservices-based platform running on AWS EKS. My day-to-day involves maintaining CI/CD pipelines with Jenkins, managing infrastructure through Terraform, and running our monitoring stack with Prometheus and Grafana.
+
+Before this, I worked at [Previous Company] where I led the migration from EC2-based deployments to containerized workloads on Kubernetes. That experience gave me deep hands-on knowledge of Docker, Helm, and cluster operations.
+
+One of my recent wins was redesigning our CI/CD pipeline — we reduced deployment time from 35 minutes to 9 minutes by implementing parallel builds and Docker layer caching. This increased team deployment frequency from 10 to 40+ deploys per week.
+
+I'm excited about this role because [reason specific to the company — their scale, tech challenges, product]."
+
+**What NOT to do:**
+- Don't recite your resume chronologically — the interviewer already has it
+- Don't go beyond 2 minutes — keep it tight
+- Don't include personal details (hobbies, family) unless asked
+- Don't be vague — "I work with cloud technologies" says nothing. "I manage 3 EKS clusters across 2 AWS regions" is specific and credible
+
+> **Also asked as:** "What is your role in your company?" — covered in Q2 above (roles and responsibilities structured around CI/CD, infrastructure, and reliability). "Explain about your current project" — covered in Q3 above.
+
+

@@ -1128,3 +1128,98 @@ The S3 → SQS → Lambda pattern is preferred over direct S3 → Lambda for hig
 - S3 can deliver to SQS with guaranteed delivery; direct S3 → Lambda has a small chance of missed events at high volume
 
 **Real scenario:** We had a data pipeline where clients upload CSV files to S3. Direct S3 → Lambda worked fine at low volume. When a client uploaded 10,000 files in a batch, Lambda hit the concurrency limit (1,000 concurrent executions by default) and S3 events were throttled — some files never got processed. We moved to S3 → SQS → Lambda with a concurrency limit on the Lambda of 100. The SQS queue absorbed all 10,000 file events. Lambda processed them at 100 concurrent executions. No files were missed. Processing time: ~10 minutes instead of near-instant, which was acceptable for this batch pipeline.
+
+---
+
+## 12. What are the use cases of CodeBuild, CodePipeline, and CodeDeploy?
+
+These are AWS's native CI/CD services. Each handles a different stage of the pipeline. Understanding when to use them (vs Jenkins, GitHub Actions, ArgoCD) is what the interviewer wants.
+
+**CodeBuild — managed build service (CI).**
+
+CodeBuild runs your build commands (compile, test, scan, build Docker image) in a managed container. You don't manage build servers.
+
+```yaml
+# buildspec.yml — goes in your app repo
+version: 0.2
+phases:
+  pre_build:
+    commands:
+      - echo Logging in to ECR
+      - aws ecr get-login-password | docker login --username AWS --password-stdin $ECR_REPO
+  build:
+    commands:
+      - docker build -t $ECR_REPO:$CODEBUILD_RESOLVED_SOURCE_VERSION .
+      - docker push $ECR_REPO:$CODEBUILD_RESOLVED_SOURCE_VERSION
+  post_build:
+    commands:
+      - echo Build completed
+artifacts:
+  files:
+    - appspec.yml
+    - taskdef.json
+```
+
+**Use cases:** Building Docker images, running unit tests, compiling code, running security scans (Trivy, SonarQube). Replaces Jenkins build agents — no EC2 instances to manage, pay per build minute.
+
+**CodePipeline — orchestration (glue between stages).**
+
+CodePipeline connects Source → Build → Deploy stages. It doesn't build or deploy itself — it triggers CodeBuild and CodeDeploy at the right time.
+
+```
+CodePipeline:
+  Source Stage:  GitHub repo (webhook trigger on push)
+       ↓
+  Build Stage:   CodeBuild (build image, run tests)
+       ↓
+  Approval:      Manual approval gate
+       ↓
+  Deploy Stage:  CodeDeploy (to EC2/ECS/Lambda)
+```
+
+**Use cases:** Orchestrating multi-stage deployments, adding manual approval gates, connecting AWS-native services together. Replaces Jenkins pipeline orchestration if you're fully in the AWS ecosystem.
+
+**CodeDeploy — deployment automation (CD).**
+
+CodeDeploy handles rolling out new code to EC2 instances, ECS services, or Lambda functions. It manages health checks, rollback, and traffic shifting.
+
+```yaml
+# appspec.yml for EC2 deployment
+version: 0.0
+os: linux
+files:
+  - source: /
+    destination: /opt/myapp
+hooks:
+  BeforeInstall:
+    - location: scripts/stop_server.sh
+  AfterInstall:
+    - location: scripts/start_server.sh
+  ValidateService:
+    - location: scripts/health_check.sh
+      timeout: 60
+```
+
+**Deployment strategies in CodeDeploy:**
+
+| Strategy | How it works | Use case |
+|---|---|---|
+| **AllAtOnce** | Deploy to all instances simultaneously | Dev/test environments |
+| **OneAtATime** | Deploy to one instance at a time | Small fleet, zero-risk |
+| **HalfAtATime** | Deploy to 50% of instances, then the other 50% | Balanced speed/safety |
+| **Blue/Green** | Spin up new instances, shift traffic, terminate old | Production (EC2 or ECS) |
+| **Canary (Lambda)** | 10% traffic to new version, then 100% | Lambda functions |
+
+**When to use AWS-native vs third-party:**
+
+| Scenario | Choose |
+|---|---|
+| AWS-only, ECS/Lambda, team prefers managed services | CodeBuild + CodePipeline + CodeDeploy |
+| Multi-cloud, complex pipelines, existing Jenkins | Jenkins + ArgoCD |
+| GitHub-centric, open-source, simple pipelines | GitHub Actions |
+| Kubernetes-first, GitOps | Jenkins/GitHub Actions (CI) + ArgoCD (CD) |
+
+**Real scenario:** We used CodePipeline + CodeDeploy for an EC2-based legacy app. The pipeline was: GitHub → CodeBuild (build JAR) → Manual Approval → CodeDeploy (rolling deploy to EC2 fleet). CodeDeploy's Blue/Green strategy spun up new instances with the new version, ran health checks, then shifted the ALB target group. Rollback was automatic if health checks failed — CodeDeploy kept the old instances alive for 1 hour.
+
+> **Also asked as:** "How to autoscale in EC2?" — covered in Q10 (Auto Scaling Groups with target tracking, step scaling, and scheduled scaling).
+

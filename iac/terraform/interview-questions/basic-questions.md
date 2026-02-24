@@ -177,3 +177,146 @@ Executes the plan. Calls AWS/GCP/Azure APIs to create/modify/delete resources. U
 Destroys all resources in the state file. We never run this in production without first checking: does `prevent_destroy = true` protect critical resources? Is the state file pointing at the right environment? We've had an incident where someone ran `terraform destroy` in a directory they thought was staging but was prod. Now we add `prevent_destroy = true` to RDS and EKS resources.
 
 > **Also asked as:** "What does the terraform init command do?" — covered above (`terraform init` downloads provider plugins, initialises modules, and configures the backend).
+
+---
+
+## 3. What's the difference between Terraform and CloudFormation?
+
+Both are Infrastructure as Code (IaC) tools — they let you define infrastructure in code and manage its lifecycle. The difference is in scope, language, state management, and ecosystem. This is not a "one is better" answer — it's a "when to use which" answer.
+
+**The fundamental difference: Terraform is cloud-agnostic. CloudFormation is AWS-native.**
+
+Terraform uses providers to manage resources across AWS, Azure, GCP, Kubernetes, Datadog, PagerDuty, GitHub — anything with an API. CloudFormation manages only AWS resources.
+
+```hcl
+# Terraform — one tool to manage AWS + Datadog + PagerDuty
+resource "aws_instance" "app" {
+  ami           = "ami-0abc123"
+  instance_type = "t3.micro"
+}
+
+resource "datadog_monitor" "cpu_alert" {
+  name    = "High CPU on app server"
+  type    = "metric alert"
+  query   = "avg(last_5m):avg:aws.ec2.cpuutilization{name:app} > 80"
+}
+
+resource "pagerduty_service" "app" {
+  name = "App Service"
+  escalation_policy = pagerduty_escalation_policy.default.id
+}
+```
+
+CloudFormation can't manage Datadog or PagerDuty. You'd need a separate tool or custom resources.
+
+**Language:**
+
+```yaml
+# CloudFormation — YAML/JSON (declarative but verbose)
+Resources:
+  AppInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-0abc123
+      InstanceType: t3.micro
+      SecurityGroupIds:
+        - !Ref AppSecurityGroup
+      Tags:
+        - Key: Name
+          Value: app-server
+```
+
+```hcl
+# Terraform — HCL (declarative, purpose-built, more readable)
+resource "aws_instance" "app" {
+  ami                    = "ami-0abc123"
+  instance_type          = "t3.micro"
+  vpc_security_group_ids = [aws_security_group.app.id]
+
+  tags = {
+    Name = "app-server"
+  }
+}
+```
+
+HCL was designed specifically for infrastructure — it has loops, conditionals, modules, and dynamic blocks that make complex configurations manageable. CloudFormation's YAML relies on intrinsic functions (`!Ref`, `!Sub`, `!If`, `Fn::Select`) that become unreadable at scale.
+
+**State management — the biggest operational difference:**
+
+| | Terraform | CloudFormation |
+|---|---|---|
+| State | You manage it (S3 + DynamoDB for locking) | AWS manages it (automatic, invisible) |
+| State corruption risk | Possible if misconfigured | Very rare |
+| State visibility | `terraform state list` — you can inspect and manipulate | Hidden — you see stack events only |
+| Import existing resources | `terraform import` | `aws cloudformation import` (limited) |
+
+Terraform's state is both its strength and its operational burden. You must secure the state file (it contains sensitive outputs), configure locking (DynamoDB), and handle state drift. CloudFormation handles all of this automatically.
+
+```hcl
+# Terraform backend — you manage this
+terraform {
+  backend "s3" {
+    bucket         = "my-terraform-state"
+    key            = "prod/infrastructure.tfstate"
+    region         = "ap-south-1"
+    dynamodb_table = "terraform-locks"   # Prevents concurrent applies
+    encrypt        = true
+  }
+}
+```
+
+**Drift detection:**
+
+CloudFormation has built-in drift detection — it tells you if someone changed a resource manually:
+
+```bash
+aws cloudformation detect-stack-drift --stack-name prod-stack
+aws cloudformation describe-stack-resource-drifts --stack-name prod-stack
+```
+
+Terraform detects drift every time you run `terraform plan` — it compares real infrastructure (via API calls) with the state file. If someone changed a security group manually, the plan shows it.
+
+**Rollback behaviour:**
+
+CloudFormation automatically rolls back on failure — if creating resource 5 out of 10 fails, it deletes resources 1–4 and returns to the previous state. This is safe but slow (cleanup can take 20 minutes).
+
+Terraform does not auto-rollback. If resource 5 fails, resources 1–4 stay created. The state file reflects what was actually created. Running `terraform apply` again retries from where it stopped. You're responsible for cleanup if you want to undo.
+
+**Module ecosystem:**
+
+| | Terraform | CloudFormation |
+|---|---|---|
+| Public modules | Terraform Registry (large ecosystem) | AWS Solutions Library (limited) |
+| Module quality | Community-maintained — verify before using | AWS-maintained — generally reliable |
+| Example | `terraform-aws-modules/vpc/aws` | AWS QuickStart templates |
+
+**When to use each:**
+
+| Scenario | Choose |
+|---|---|
+| Multi-cloud (AWS + Azure + GCP) | Terraform |
+| AWS-only shop with simpler infrastructure | Either works |
+| Team with no IaC experience, wants managed state | CloudFormation (lower ops burden) |
+| Complex infrastructure with modules, loops, dynamic config | Terraform (HCL is more expressive) |
+| Need to manage non-AWS resources (Datadog, GitHub, K8s) | Terraform |
+| AWS native services deeply integrated (SAM for Lambda, CDK) | CloudFormation / CDK |
+| Compliance requirement for automatic rollback on failure | CloudFormation |
+
+**AWS CDK — the modern CloudFormation experience:**
+
+AWS CDK (Cloud Development Kit) generates CloudFormation under the hood but lets you write infrastructure in Python, TypeScript, or Java. It brings real programming language constructs (loops, classes, inheritance) to CloudFormation:
+
+```typescript
+// CDK (TypeScript) — compiles to CloudFormation YAML
+const vpc = new ec2.Vpc(this, 'AppVpc', { maxAzs: 3 });
+const cluster = new ecs.Cluster(this, 'AppCluster', { vpc });
+```
+
+CDK is worth considering if you're AWS-only and your team prefers a real programming language over HCL. But the output is still CloudFormation — with its state management model, rollback behavior, and AWS-only scope.
+
+**What we use and why:**
+
+We use Terraform for everything — AWS infrastructure, Kubernetes resources (via the `kubernetes` provider), Datadog monitors, PagerDuty services, and GitHub repository settings. One tool, one workflow (`plan → review → apply`), one state management pattern. We evaluated CDK and CloudFormation — CDK was appealing for its programming language support, but we'd still need Terraform for Datadog and GitHub. Running two IaC tools doubles the operational complexity (two pipelines, two state management strategies, two sets of expertise). Standardizing on Terraform was the pragmatic choice.
+
+**Real scenario:** We inherited a project that used CloudFormation for VPC/EC2 and Terraform for EKS/Kubernetes. Any change that involved both layers (adding a subnet AND deploying a service to it) required two separate PRs, two separate applies, and careful ordering. We migrated everything to Terraform over 3 weeks — VPC moved first, then EC2, then Route53. Each migration was a `terraform import` of existing resources. After migration: one PR, one pipeline, one apply. Deployment time for infrastructure changes dropped from 45 minutes (two sequential pipeline runs) to 15 minutes (one run).
+

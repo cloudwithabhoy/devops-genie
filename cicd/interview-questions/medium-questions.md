@@ -493,3 +493,387 @@ spec:
 When the CI pipeline merges to main and updates `values-prod.yaml`, ArgoCD shows the prod app as "OutOfSync" but doesn't deploy. A release manager reviews the diff in ArgoCD UI and clicks "Sync" to approve the deployment. This is our preferred pattern — the approval UI shows exactly what will change in the cluster, not just "do you want to deploy?"
 
 **Real scenario:** Before we added approval gates, a developer accidentally merged a PR to `main` that had `LOG_LEVEL=debug` hardcoded (should have been an env var). The CI pipeline auto-deployed to production. Log volume increased 40x. CloudWatch costs spiked. After 20 minutes someone noticed and we rolled back. After adding a manual gate: that same PR would have been caught during the 30-minute staging observation window before anyone clicked "Approve for Prod."
+
+---
+
+## 6. How do you design a CI/CD pipeline for a secure deployment?
+
+A secure CI/CD pipeline isn't just "add a security scan." It's designing the pipeline so that insecure code, vulnerable dependencies, misconfigured infrastructure, and leaked secrets **cannot** reach production. Security is a gate at every stage, not an afterthought.
+
+**The pipeline stages with security at each gate:**
+
+```
+Code Commit → Build → Test → Security Scan → Stage Deploy → Approval → Prod Deploy
+     ↑           ↑       ↑         ↑              ↑            ↑           ↑
+  Branch       Deps    Unit     SAST/DAST/       Smoke +     Manual      Canary/
+  protection   lock    + int    Image scan      observe      gate       Blue-Green
+  + signed     file    tests                    window
+  commits
+```
+
+**Stage 1 — Secure the code before it enters the pipeline.**
+
+```yaml
+# GitHub branch protection — enforce before merge
+Branch protection rules:
+  ✓ Require pull request reviews (2 reviewers minimum for prod services)
+  ✓ Require status checks to pass (CI must succeed)
+  ✓ Require signed commits (GPG-signed — proves who wrote the code)
+  ✓ Restrict who can push to main (only CI bot or release managers)
+  ✓ No force pushes to main
+```
+
+No direct commits to `main`. Every change goes through a PR with code review. The reviewer is responsible for catching insecure patterns — hardcoded secrets, overly permissive IAM policies, SQL injection vectors.
+
+**Stage 2 — Dependency scanning and lockfile enforcement.**
+
+```groovy
+// Jenkinsfile — fail the build if dependencies have critical CVEs
+stage('Dependency Audit') {
+  steps {
+    sh 'npm audit --audit-level=critical'       // Node.js
+    sh 'pip-audit --require-hashes -r requirements.txt'  // Python
+    sh 'trivy fs --scanners vuln --severity CRITICAL .'  // Universal
+  }
+}
+```
+
+Lock files (`package-lock.json`, `requirements.txt` with hashes, `go.sum`) must be committed. Without a lockfile, `npm install` in CI might pull a different (compromised) version than what was tested locally.
+
+**Stage 3 — Static Application Security Testing (SAST).**
+
+```groovy
+stage('SAST') {
+  parallel {
+    stage('SonarQube') {
+      steps {
+        // Scans source code for: SQL injection, XSS, hardcoded secrets,
+        // insecure deserialization, command injection
+        sh 'sonar-scanner -Dsonar.projectKey=order-service'
+      }
+    }
+    stage('Secrets Detection') {
+      steps {
+        // Catches API keys, passwords, tokens accidentally committed
+        sh 'trufflehog filesystem --directory . --only-verified'
+        // Or: gitleaks detect --source .
+      }
+    }
+  }
+}
+```
+
+SonarQube with quality gates: if new code introduces any Critical security hotspot, the pipeline fails. No exceptions. We caught a developer who hardcoded a Stripe test key — `trufflehog` flagged it before it reached `main`.
+
+**Stage 4 — Container image scanning.**
+
+```groovy
+stage('Build & Scan Image') {
+  steps {
+    sh 'docker build -t $ECR_REPO:$GIT_COMMIT .'
+
+    // Scan the built image for OS and library CVEs
+    sh '''
+      trivy image \
+        --exit-code 1 \
+        --severity CRITICAL,HIGH \
+        --ignore-unfixed \
+        $ECR_REPO:$GIT_COMMIT
+    '''
+
+    // Lint the Dockerfile for best practices
+    sh 'hadolint Dockerfile'
+    // Catches: running as root, no healthcheck, unpinned base image
+  }
+}
+```
+
+Images that fail the scan don't get pushed to ECR. Period. The `--ignore-unfixed` flag avoids blocking on CVEs that don't have a fix yet (otherwise you'd be stuck indefinitely).
+
+**Stage 5 — Infrastructure as Code scanning.**
+
+```groovy
+stage('IaC Security') {
+  steps {
+    // Scan Terraform for misconfigurations
+    sh 'checkov -d terraform/ --framework terraform --check HIGH,CRITICAL'
+    // Catches: S3 buckets without encryption, security groups open to 0.0.0.0/0,
+    // RDS without backup, Lambda without VPC
+  }
+}
+```
+
+Checkov or `tfsec` runs on every PR that touches Terraform code. A security group rule that opens port 22 to the world is caught here, not in a quarterly audit.
+
+**Stage 6 — Deploy to staging with smoke tests and observation.**
+
+```groovy
+stage('Deploy Staging') {
+  steps {
+    sh 'helm upgrade --install order-service ./chart -f values-staging.yaml -n staging'
+    sh 'kubectl rollout status deployment/order-service -n staging --timeout=120s'
+  }
+}
+stage('Staging Smoke Tests') {
+  steps {
+    sh './scripts/smoke-test.sh staging'
+    // Tests: health endpoint, auth flow, core CRUD operations
+    // Verifies: no 5xx errors, response times within SLO
+  }
+}
+stage('Observation Window') {
+  steps {
+    // Wait 30 minutes — watch error rate and latency in staging
+    sleep(time: 30, unit: 'MINUTES')
+    // Automated check: Prometheus query — error rate < 1% in last 30 min
+    sh '''
+      ERROR_RATE=$(curl -s "http://prometheus:9090/api/v1/query?query=..." | jq '.data.result[0].value[1]')
+      if (( $(echo "$ERROR_RATE > 0.01" | bc -l) )); then
+        echo "Error rate too high in staging: $ERROR_RATE"
+        exit 1
+      fi
+    '''
+  }
+}
+```
+
+**Stage 7 — Manual approval gate for production.**
+
+```groovy
+stage('Production Approval') {
+  steps {
+    timeout(time: 60, unit: 'MINUTES') {
+      input(
+        message: "Deploy ${env.IMAGE_TAG} to production?",
+        ok: 'Deploy to Prod',
+        submitter: 'release-managers'  // Only specific roles can approve
+      )
+    }
+  }
+}
+```
+
+**Stage 8 — Production deployment with rollback capability.**
+
+```groovy
+stage('Deploy Production') {
+  steps {
+    // Update manifest repo (GitOps)
+    sh '''
+      yq -i '.image.tag = "${GIT_COMMIT}"' k8s-manifests/apps/order-service/values-prod.yaml
+      git commit -am "ci: deploy order-service ${GIT_COMMIT}"
+      git push
+    '''
+    // ArgoCD syncs the change to the cluster
+    // Canary or blue/green strategy for production
+  }
+}
+stage('Post-Deploy Validation') {
+  steps {
+    sh './scripts/smoke-test.sh production'
+    // If smoke test fails → automatic rollback
+  }
+  post {
+    failure {
+      sh 'kubectl rollout undo deployment/order-service -n prod'
+      slackSend channel: '#incidents', message: "🔴 Auto-rollback: order-service deploy failed in prod"
+    }
+  }
+}
+```
+
+**Secrets management in the pipeline:**
+
+```groovy
+// NEVER: hardcoded credentials in Jenkinsfile
+// NEVER: credentials in environment variables visible in build logs
+
+// Use Jenkins credential store or HashiCorp Vault
+withCredentials([
+  string(credentialsId: 'ecr-token', variable: 'ECR_TOKEN'),
+  usernamePassword(credentialsId: 'sonar-creds', usernameVariable: 'SONAR_USER', passwordVariable: 'SONAR_PASS')
+]) {
+  sh 'docker login -u AWS -p $ECR_TOKEN $ECR_REPO'
+}
+// Credentials are masked in build logs — never printed in plaintext
+```
+
+**Pipeline security checklist:**
+
+```
+☐ Branch protection on main (2 reviewers, CI must pass)
+☐ Dependency audit with lockfile verification
+☐ SAST scan (SonarQube) with quality gate
+☐ Secret detection (trufflehog / gitleaks)
+☐ Container image scan (Trivy) — block CRITICAL/HIGH
+☐ Dockerfile lint (Hadolint) — no root, pinned base images
+☐ IaC scan (Checkov) — no open security groups, encryption enforced
+☐ Staging deploy + 30-min observation window
+☐ Manual approval for production
+☐ Production deploy with auto-rollback on smoke test failure
+☐ Secrets in credential store, never in code or env vars
+☐ Build logs don't contain credentials (masked)
+☐ Image signing (Cosign) for supply chain integrity
+```
+
+**Real scenario:** We had a pipeline that ran image scanning but only scanned the final layer of a multi-stage Docker build. A developer added a `curl` command in a build stage that downloaded a binary from a personal GitHub repo — it passed the scan because the final image didn't contain `curl`. After the incident, we added: (1) Hadolint to catch `ADD` from external URLs, (2) network policies in the CI runner to block outbound internet during builds (only ECR and approved registries), and (3) a policy that all base images must come from our internal ECR registry (mirrors of official images, scanned weekly). No more arbitrary downloads during builds.
+
+> **Also asked as:** "How do you integrate security into your CI/CD pipeline?" — covered above (SAST, dependency scanning, image scanning, IaC scanning, secrets management, approval gates, and auto-rollback).
+
+---
+
+## 7. How will you deploy an application using Argo CD?
+
+ArgoCD follows the GitOps model — the Git repository is the single source of truth for what should be running in the cluster. You don't `kubectl apply` or `helm install` manually. You update the manifest in Git, and ArgoCD syncs the cluster to match.
+
+**The workflow:**
+
+```
+Developer merges PR → CI pipeline builds image → CI updates manifest repo → ArgoCD detects change → ArgoCD syncs cluster
+```
+
+**Step 1 — Install ArgoCD in the cluster:**
+
+```bash
+kubectl create namespace argocd
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+# Get the initial admin password
+kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d
+```
+
+**Step 2 — Create an ArgoCD Application that points at your manifest repo:**
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: order-service
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/my-org/k8s-manifests.git
+    targetRevision: main
+    path: apps/order-service         # Folder containing Helm chart or YAML
+    helm:
+      valueFiles:
+        - values-prod.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: prod
+  syncPolicy:
+    automated:                       # Auto-sync for staging
+      prune: true                    # Delete resources removed from Git
+      selfHeal: true                 # Revert manual kubectl changes
+    syncOptions:
+      - CreateNamespace=true
+```
+
+**Step 3 — Deploy by updating the manifest repo:**
+
+```bash
+# CI pipeline updates the image tag in the values file
+yq -i '.image.tag = "abc123"' apps/order-service/values-prod.yaml
+git commit -am "ci: deploy order-service abc123"
+git push
+
+# ArgoCD detects the change within 3 minutes (polling interval)
+# Or trigger sync immediately:
+argocd app sync order-service
+```
+
+**For production — disable auto-sync, require manual approval:**
+
+```yaml
+syncPolicy: {}    # Empty — no auto-sync. ArgoCD shows "OutOfSync" until someone clicks Sync
+```
+
+A release manager reviews the diff in ArgoCD UI (shows exactly what changed), clicks "Sync", and the deployment rolls out.
+
+**Key commands:**
+
+```bash
+argocd app list                              # All apps and their sync status
+argocd app get order-service                 # Detailed status
+argocd app sync order-service                # Trigger sync
+argocd app rollback order-service 2          # Rollback to revision 2
+argocd app diff order-service                # Show what would change
+```
+
+---
+
+## 8. How do you integrate Argo CD with Jenkins?
+
+Jenkins handles CI (build, test, scan, push image). ArgoCD handles CD (deploy to cluster). They connect through a **manifest Git repository** — Jenkins writes to it, ArgoCD reads from it.
+
+**The integration flow:**
+
+```
+Jenkins Pipeline:
+  1. Build Docker image → push to ECR
+  2. Update image tag in manifest repo (Git commit)
+        ↓
+ArgoCD:
+  3. Detects manifest change → syncs cluster
+  4. Rolls out new pods with new image
+```
+
+**Jenkins pipeline (the CI part):**
+
+```groovy
+pipeline {
+  stages {
+    stage('Build & Push') {
+      steps {
+        sh 'docker build -t $ECR_REPO:$GIT_COMMIT .'
+        sh 'docker push $ECR_REPO:$GIT_COMMIT'
+      }
+    }
+    stage('Update Manifests') {
+      steps {
+        // Clone the manifest repo, update the image tag, push
+        sh '''
+          git clone https://github.com/my-org/k8s-manifests.git
+          cd k8s-manifests
+          yq -i '.image.tag = "'$GIT_COMMIT'"' apps/order-service/values-prod.yaml
+          git config user.email "ci@company.com"
+          git commit -am "ci: deploy order-service $GIT_COMMIT [skip ci]"
+          git push
+        '''
+        // [skip ci] prevents Jenkins from triggering on its own commit
+      }
+    }
+  }
+}
+```
+
+**ArgoCD (the CD part):**
+
+ArgoCD watches the manifest repo. When Jenkins pushes the updated `values-prod.yaml`, ArgoCD detects the change and syncs — no ArgoCD CLI calls needed from Jenkins.
+
+**Why this separation matters:**
+- Jenkins doesn't need cluster credentials — it never runs `kubectl` or `helm`
+- ArgoCD has cluster access but doesn't need Docker/ECR access
+- Separation of concerns: CI team owns Jenkins, platform team owns ArgoCD
+- Full audit trail in Git — every deployment is a Git commit with author, timestamp, PR link
+
+**Alternative: Jenkins triggers ArgoCD sync directly:**
+
+```groovy
+stage('Trigger ArgoCD Sync') {
+  steps {
+    sh '''
+      argocd app sync order-service \
+        --auth-token $ARGOCD_TOKEN \
+        --server argocd.internal \
+        --grpc-web
+    '''
+  }
+}
+```
+
+We avoid this pattern because it couples Jenkins to ArgoCD — if ArgoCD is temporarily unavailable, the Jenkins pipeline fails. With the Git-commit approach, Jenkins always succeeds (it just pushes to Git), and ArgoCD syncs whenever it's ready.
+
+> **Also asked as:** "What is GitOps and how do you implement it?" — GitOps = Git as the single source of truth for infrastructure and app deployment. ArgoCD watches Git repos and ensures cluster state matches. See above for the full Jenkins + ArgoCD implementation.
+
