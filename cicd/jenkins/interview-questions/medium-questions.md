@@ -333,6 +333,8 @@ sh "docker build --build-arg DB_PASS=$DB_PASSWORD ."
 
 **Real incident:** A developer ran `echo $AWS_SECRET_ACCESS_KEY` inside a Jenkins pipeline step to debug a credential issue.
 
+> **Also asked as:** "How do you store secrets in Jenkins?" — covered above (Jenkins Credentials Store, `credentials()` binding, `withCredentials`, masking in logs).
+
 ---
 
 ## 5. What is the concept of Pipeline as Code in Jenkins?
@@ -649,3 +651,135 @@ stage('Test + Scan in Parallel') {
 ```
 
 Running Unit Tests (2 min), Integration Tests (3 min), and Scan (1 min) in parallel takes 3 minutes instead of 6. This is the single biggest pipeline optimization available. The console output was visible to all engineers with Jenkins read access — 23 people. The access key was rotated within 10 minutes of discovery, but CloudTrail showed no unauthorized usage. After this: mandatory pipeline code review that checks for `echo` + credential variable patterns, and all credentials moved from Jenkins store to Secrets Manager with the IAM instance profile approach. No human can now see the actual secret values — not even Jenkins admins.
+
+---
+
+## 9. How do you implement SonarQube in a Jenkins pipeline?
+
+SonarQube is a static code analysis tool that scans your code for bugs, vulnerabilities, code smells, and test coverage. Integrating it into Jenkins ensures every build is analysed before deployment.
+
+**Prerequisites:**
+1. SonarQube server running (self-hosted or SonarCloud)
+2. SonarQube Scanner plugin installed in Jenkins
+3. SonarQube server configured in Jenkins (Manage Jenkins → Configure System → SonarQube servers)
+4. A token generated in SonarQube (My Account → Security → Generate Token) stored as a Jenkins credential
+
+**Step 1: Configure SonarQube in Jenkins.**
+
+```
+Manage Jenkins → Configure System → SonarQube servers
+  Name: SonarQube
+  Server URL: http://sonarqube.internal:9000
+  Server authentication token: <select the credential storing your SonarQube token>
+```
+
+**Step 2: Add the SonarQube scan stage to your Jenkinsfile.**
+
+```groovy
+pipeline {
+  agent { label 'docker-agent' }
+
+  environment {
+    SONAR_PROJECT_KEY = "my-app"
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Build') {
+      steps {
+        sh 'mvn clean package -DskipTests'
+      }
+    }
+
+    stage('Unit Tests') {
+      steps {
+        sh 'mvn test'
+      }
+      post {
+        always {
+          junit 'target/surefire-reports/*.xml'
+        }
+      }
+    }
+
+    stage('SonarQube Analysis') {
+      steps {
+        // withSonarQubeEnv injects SONAR_HOST_URL and SONAR_AUTH_TOKEN automatically
+        withSonarQubeEnv('SonarQube') {
+          sh '''
+            mvn sonar:sonar \
+              -Dsonar.projectKey=$SONAR_PROJECT_KEY \
+              -Dsonar.projectName="My App" \
+              -Dsonar.java.binaries=target/classes \
+              -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+          '''
+        }
+      }
+    }
+
+    stage('Quality Gate') {
+      steps {
+        // Wait for SonarQube to finish analysis and check the result
+        timeout(time: 5, unit: 'MINUTES') {
+          waitForQualityGate abortPipeline: true
+          // If Quality Gate fails → pipeline aborts here, does not deploy
+        }
+      }
+    }
+
+    stage('Deploy') {
+      when { branch 'main' }
+      steps {
+        sh 'helm upgrade --install myapp ./helm --set image.tag=$GIT_COMMIT'
+      }
+    }
+  }
+}
+```
+
+**For non-Maven projects (Node.js, Python) — use the sonar-scanner CLI:**
+
+```groovy
+stage('SonarQube Analysis') {
+  steps {
+    withSonarQubeEnv('SonarQube') {
+      sh '''
+        sonar-scanner \
+          -Dsonar.projectKey=my-node-app \
+          -Dsonar.sources=src \
+          -Dsonar.exclusions=node_modules/**,coverage/** \
+          -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+      '''
+    }
+  }
+}
+```
+
+**The Quality Gate — what it checks:**
+
+A Quality Gate is a set of conditions defined in SonarQube that code must pass:
+- Coverage on new code > 80%
+- No new critical/blocker bugs
+- No new critical vulnerabilities
+- Duplicated lines on new code < 3%
+
+If any condition fails, `waitForQualityGate abortPipeline: true` fails the pipeline — the build never reaches the deploy stage. This enforces code quality as a mandatory step, not an optional report.
+
+**sonar-project.properties (alternative to passing all flags in the pipeline):**
+
+```properties
+# sonar-project.properties — place at project root
+sonar.projectKey=my-app
+sonar.projectName=My App
+sonar.sources=src
+sonar.tests=tests
+sonar.python.coverage.reportPaths=coverage.xml
+sonar.exclusions=**/__pycache__/**,**/*.pyc
+```
+
+With this file present, the scanner picks up all settings automatically — the Jenkins stage only needs `sonar-scanner` with no extra flags.

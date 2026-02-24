@@ -324,6 +324,8 @@ resource "aws_dynamodb_table" "terraform_lock" {
 
 **Real incident without remote state:** A junior engineer ran `terraform apply` from their local machine (using local state) after a colleague had already applied from a different machine. The local state was 3 days out of date. Terraform didn't know about 4 security groups created in the meantime. It treated them as "not managed" and on the next destroy — nuked them. Three services lost their security groups simultaneously. 22-minute partial outage. After this, we made remote state non-negotiable in our onboarding checklist.
 
+> **Also asked as:** "What is the .tfstate file and where is it stored?" — covered above (maps resource blocks to real cloud resources; stored in S3 + DynamoDB lock for team use).
+
 ---
 
 ## 4. What is `terraform taint`, and when would you use it vs terraform import?
@@ -514,3 +516,254 @@ We had `count = length(var.availability_zones)` for subnets. When we changed the
 Migrated to `for_each = toset(var.availability_zones)`. Now reordering the list causes zero changes in the plan. Resources are identified by AZ name, not position.
 
 **Rule of thumb:** Default to `for_each`. Use `count` only for simple on/off toggles or when creating genuinely identical, interchangeable resources.
+
+---
+
+## 6. How do you structure modules and code in Terraform?
+
+Terraform modules are reusable, self-contained packages of configuration. A well-structured module layout makes the codebase scalable, avoids duplication, and lets teams work on different environments independently.
+
+**Standard module structure:**
+
+```
+terraform/
+├── modules/                      # Reusable modules (shared building blocks)
+│   ├── eks/
+│   │   ├── main.tf               # Resource definitions
+│   │   ├── variables.tf          # Input variables
+│   │   ├── outputs.tf            # Output values
+│   │   └── versions.tf           # Required providers + versions
+│   ├── rds/
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   └── outputs.tf
+│   └── vpc/
+│       ├── main.tf
+│       ├── variables.tf
+│       └── outputs.tf
+│
+├── environments/                 # Environment-specific root configurations
+│   ├── dev/
+│   │   ├── main.tf               # Calls modules with dev-specific values
+│   │   ├── variables.tf
+│   │   ├── terraform.tfvars      # Dev variable values
+│   │   └── backend.tf            # Remote state config for dev
+│   ├── staging/
+│   │   ├── main.tf
+│   │   └── backend.tf
+│   └── prod/
+│       ├── main.tf
+│       └── backend.tf
+```
+
+**Example: calling a module from an environment:**
+
+```hcl
+# environments/prod/main.tf
+
+module "vpc" {
+  source = "../../modules/vpc"
+
+  cidr_block         = "10.0.0.0/16"
+  availability_zones = ["ap-south-1a", "ap-south-1b", "ap-south-1c"]
+  environment        = "prod"
+}
+
+module "eks" {
+  source = "../../modules/eks"
+
+  cluster_name    = "prod-cluster"
+  vpc_id          = module.vpc.vpc_id           # Output from vpc module
+  subnet_ids      = module.vpc.private_subnets  # Output from vpc module
+  instance_type   = "m5.xlarge"
+  desired_nodes   = 6
+  environment     = "prod"
+}
+
+module "rds" {
+  source = "../../modules/rds"
+
+  identifier     = "prod-postgres"
+  instance_class = "db.r6g.2xlarge"
+  vpc_id         = module.vpc.vpc_id
+  subnet_ids     = module.vpc.private_subnets
+  multi_az       = true
+}
+```
+
+**What goes in each file:**
+
+```hcl
+# variables.tf — define inputs with types and descriptions
+variable "instance_type" {
+  description = "EC2 instance type for EKS nodes"
+  type        = string
+  default     = "m5.large"
+}
+
+variable "desired_nodes" {
+  description = "Desired number of worker nodes"
+  type        = number
+}
+
+# outputs.tf — expose values other modules/environments can use
+output "cluster_endpoint" {
+  description = "EKS cluster API server endpoint"
+  value       = aws_eks_cluster.main.endpoint
+}
+
+output "cluster_name" {
+  value = aws_eks_cluster.main.name
+}
+
+# versions.tf — pin provider versions for reproducibility
+terraform {
+  required_version = ">= 1.6.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+```
+
+**Benefits of this structure:**
+
+- **DRY (Don't Repeat Yourself)** — VPC module written once, used in dev/staging/prod
+- **Isolation** — running `terraform apply` in `environments/dev/` can only affect dev infrastructure
+- **Testable** — modules can be tested independently with tools like Terratest
+- **Versioned** — modules can be published to a Terraform registry and pinned to versions
+
+```hcl
+# Using a versioned module from the Terraform Registry
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "5.5.2"    # Pinned version — reproducible builds
+  ...
+}
+
+---
+
+## 7. What is the difference between Terraform and CloudFormation?
+
+Both are infrastructure-as-code tools, but they have different philosophies and trade-offs. Knowing when to choose which is the key part of this answer.
+
+| | Terraform | CloudFormation |
+|---|---|---|
+| **Cloud support** | Multi-cloud (AWS, Azure, GCP, Kubernetes, Datadog…) | AWS only |
+| **Language** | HCL (HashiCorp Configuration Language) | YAML or JSON |
+| **State management** | Own state file (local or remote in S3 + DynamoDB) | Managed by AWS (no file to maintain) |
+| **Rollback on failure** | Manual (fix code + re-apply or git revert) | Automatic stack rollback to last good state |
+| **Dry run** | `terraform plan` | Change sets |
+| **Drift detection** | `terraform plan` shows drift | Native drift detection feature |
+| **Module ecosystem** | Large community registry (`registry.terraform.io`) | Nested stacks (more complex) |
+| **Import existing infra** | `terraform import` | `aws cloudformation import` |
+
+---
+
+**When to use CloudFormation:**
+
+- AWS-only shop with no plans to go multi-cloud
+- You want automatic rollback on stack failure — CloudFormation rolls back the entire stack atomically if any resource fails to create
+- Deep integration with AWS services: Service Catalog, Config Rules, StackSets for multi-account deployment
+- You don't want to manage a state file
+
+**When to use Terraform:**
+
+- Multi-cloud or hybrid (AWS + Azure, or AWS + Kubernetes + Datadog)
+- Team already familiar with HCL
+- You want the strong module ecosystem — community modules for EKS, VPC, RDS save weeks of work
+- You need to manage non-AWS resources (DNS in Cloudflare, monitoring in Datadog) in the same IaC workflow
+
+---
+
+**The rollback difference is important:**
+
+```
+CloudFormation failure:
+  Stack update fails at resource 7 of 20
+  → CloudFormation automatically reverses resources 1–6
+  → Stack returns to previous working state
+
+Terraform failure:
+  Apply fails at resource 7 of 20
+  → Resources 1–6 were created and are NOT rolled back
+  → State file reflects partial apply
+  → You must fix the code and re-run terraform apply
+  → Or manually destroy the partially created resources
+```
+
+This is why CloudFormation is preferred in environments that need atomic, all-or-nothing deployments (financial services, regulated industries).
+
+**Our team uses Terraform because:**
+- We manage AWS + Kubernetes + Datadog in the same codebase
+- The module ecosystem for EKS saved us weeks of configuration work
+- `terraform plan` in CI gives us the exact diff before any change is applied
+- We've built runbooks for failure recovery — the lack of auto-rollback hasn't been a practical issue
+
+---
+
+## 8. How do you manage Terraform provider versioning?
+
+Provider versioning prevents breaking changes from automatically entering your infrastructure when a provider releases a new version.
+
+**Declare version constraints in `versions.tf`.**
+
+```hcl
+terraform {
+  required_version = ">= 1.6.0"    # Minimum Terraform CLI version
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"    # Allow 5.x but not 6.x
+    }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.25"
+    }
+    helm = {
+      source  = "hashicorp/helm"
+      version = ">= 2.12, < 3.0"
+    }
+  }
+}
+```
+
+**Version constraint operators:**
+
+| Operator | Meaning | Example |
+|---|---|---|
+| `= 5.31.0` | Exact version only | Pins to one version |
+| `~> 5.31` | Allow patch updates (5.31.x) | Safe for most cases |
+| `~> 5.0` | Allow minor updates (5.x) | More flexible |
+| `>= 5.0, < 6.0` | Range | Explicit bounds |
+
+**Lock file — `.terraform.lock.hcl`.**
+
+`terraform init` generates a lock file that records the exact provider version and checksum used:
+
+```hcl
+# .terraform.lock.hcl — commit this to Git
+provider "registry.terraform.io/hashicorp/aws" {
+  version     = "5.31.0"
+  constraints = "~> 5.0"
+  hashes = [
+    "h1:abc123...",   # Integrity checksum
+  ]
+}
+```
+
+The lock file ensures every team member and every CI run uses the **exact same provider version**, even if a newer version in the `~> 5.0` range is released.
+
+```bash
+# Update providers (upgrades within constraints):
+terraform init -upgrade
+
+# Review what changed, commit the updated lock file
+git diff .terraform.lock.hcl
+git add .terraform.lock.hcl && git commit -m "upgrade aws provider to 5.35.0"
+```
+
+**Real scenario:** Our team didn't commit the lock file. AWS provider released 5.20.0 which changed the behaviour of `aws_security_group` resource — existing rules were now treated as external and removed on next apply. One engineer's `terraform plan` showed no changes (they had 5.19.0 in cache), another's showed destruction of all security group rules (5.20.0). We committed the lock file immediately. Provider upgrades are now a deliberate PR with a plan review, not an accidental side effect of running `terraform init`.

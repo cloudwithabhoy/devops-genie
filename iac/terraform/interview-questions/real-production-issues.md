@@ -133,6 +133,8 @@ Any PR with a `-/+` in the plan gets a failed pipeline check. An engineer must e
 
 **Real scenario:** A developer refactored our Terraform module and renamed `aws_elasticache_cluster.cache` to `aws_elasticache_cluster.redis`. The plan showed `-/+` — destroy the existing ElastiCache cluster and create a new one. In production. During business hours. That's a full cache flush and ~5 minutes of every database query hitting the DB directly. The pipeline's replacement check caught it before merge. Fix: `terraform state mv`. Plan went to "No changes." Zero downtime, zero cache flush. If the check hadn't existed, we'd have merged it thinking it was just a rename.
 
+> **Also asked as:** "Terraform plan shows destroy + recreate for a critical DB — how do you prevent downtime?" — covered above (`terraform state mv` to rename without replace, `lifecycle { ignore_changes }` for drift, `create_before_destroy` for safe replacement, `prevent_destroy` as hard stop).
+
 ---
 
 ## 2. You accidentally ran `terraform destroy` on production — what do you do?
@@ -277,3 +279,356 @@ fi
 ```
 
 **Real scenario:** A data engineer ran `terraform destroy` in what they thought was the `staging` workspace. The terminal prompt showed `prod` — they were in a different tmux pane than they thought. `prevent_destroy` stopped the RDS instance from being deleted. The EKS node group was destroyed before they interrupted it. Recovery: `terraform apply` recreated the node group in 8 minutes. RDS was never touched. If `prevent_destroy` wasn't set on RDS, that would have been a full data restore from backup — 4+ hours of downtime.
+
+---
+
+## 3. What do you do when your Terraform state file becomes too large?
+
+A state file grows large when all infrastructure is managed in a single root module — hundreds of resources, all in one `terraform.tfstate`. The problems: slow `terraform plan` (reads every resource from AWS), high blast radius on any mistake, and difficult team collaboration.
+
+**Signs it's too large:**
+- `terraform plan` takes 10+ minutes
+- State file is >10MB
+- One team's change triggers plan for another team's resources
+- Accidental destroy risk is high (one `terraform destroy` kills everything)
+
+**Solution 1: Split into smaller state files (stacks by domain).**
+
+```
+Before (monolith):
+  terraform/
+    main.tf   ← 500 resources, one state file
+
+After (split by domain):
+  terraform/
+    networking/    ← VPC, subnets, route tables
+    eks/           ← EKS cluster, node groups, Karpenter
+    rds/           ← RDS instances, parameter groups
+    iam/           ← IAM roles, policies
+    monitoring/    ← CloudWatch, Grafana, Prometheus
+```
+
+Each directory has its own `terraform.tfstate` in S3. Teams own their slice and only plan/apply changes to their domain.
+
+**Cross-stack references with `terraform_remote_state`.**
+
+```hcl
+# eks/main.tf — read VPC outputs from the networking state
+data "terraform_remote_state" "networking" {
+  backend = "s3"
+  config = {
+    bucket = "my-terraform-state"
+    key    = "networking/terraform.tfstate"
+    region = "ap-south-1"
+  }
+}
+
+resource "aws_eks_cluster" "main" {
+  vpc_config {
+    subnet_ids = data.terraform_remote_state.networking.outputs.private_subnet_ids
+  }
+}
+```
+
+**Solution 2: Move resources to a new state without destroying them.**
+
+```bash
+# Move a resource from the monolith state to the new networking state:
+terraform state mv \
+  -state=terraform.tfstate \
+  -state-out=networking/terraform.tfstate \
+  aws_vpc.main \
+  aws_vpc.main
+
+# Verify it moved:
+terraform -chdir=networking state list | grep aws_vpc
+```
+
+The resource stays in AWS — only its state tracking moves. No downtime.
+
+**Solution 3: Use `moved` blocks (Terraform 1.1+) for safe refactoring.**
+
+```hcl
+# In the new networking module, declare where resources moved from:
+moved {
+  from = aws_vpc.main
+  to   = module.networking.aws_vpc.main
+}
+```
+
+**Real scenario:** Our monolith state had 380 resources. `terraform plan` took 18 minutes and scanned every resource in our account. We split into 6 stacks over 2 sprints using `terraform state mv`. After the split, each stack's plan takes 2–3 minutes. Teams work independently without merge conflicts on the state file. Most importantly — a mistake in the monitoring stack can't accidentally destroy the EKS cluster anymore.
+
+---
+
+## 4. Your Terraform apply succeeded, but some resources are not behaving as expected — how do you debug?
+
+`terraform apply` exiting 0 means Terraform successfully made the API calls and the state file was updated. It does not mean the resources are working correctly. Many issues only appear after the resource is running.
+
+**Step 1 — Check what Terraform actually applied.**
+
+```bash
+# Show the current state of the resource — exactly what attributes Terraform recorded
+terraform show -json | jq '.values.root_module.resources[] | select(.address == "aws_lb.main")'
+
+# Or for a specific resource
+terraform state show aws_lb.main
+# Shows all attributes: DNS name, ARN, subnets, security groups, access logs config, etc.
+```
+
+Compare this against what you expected. If an attribute is wrong (wrong subnet, wrong port), you've found the issue.
+
+**Step 2 — Compare state vs actual AWS resource.**
+
+Terraform state records what it *applied*, but the actual resource might be different if:
+- The apply partially failed and was retried
+- AWS modified the resource after creation (auto-scaling, version upgrades)
+- Another Terraform run or manual change modified it
+
+```bash
+# Force Terraform to re-read current state from AWS
+terraform plan -refresh-only
+# If this shows differences → drift between state and actual resource
+# Apply the refresh to update state without changing infrastructure
+terraform apply -refresh-only
+```
+
+**Step 3 — Check the AWS resource directly.**
+
+Terraform is a layer on top of AWS APIs. If something is wrong, verify at the AWS level:
+
+```bash
+# Example: ALB not routing correctly
+aws elbv2 describe-load-balancers --names my-alb
+aws elbv2 describe-listeners --load-balancer-arn <alb-arn>
+aws elbv2 describe-target-groups --load-balancer-arn <alb-arn>
+aws elbv2 describe-target-health --target-group-arn <tg-arn>
+
+# Example: EKS node group not joining the cluster
+aws eks describe-nodegroup --cluster-name prod --nodegroup-name general
+# Look for: "status": "ACTIVE" vs "DEGRADED"
+# "health.issues" array shows the exact problem
+```
+
+**Step 4 — Check CloudTrail for what actually happened during apply.**
+
+```bash
+# What API calls did Terraform make during the apply?
+aws cloudtrail lookup-events \
+  --start-time "2024-01-15T14:00:00Z" \
+  --end-time "2024-01-15T14:30:00Z" \
+  --lookup-attributes AttributeKey=Username,AttributeValue=<ci-role-name> \
+  | jq '.Events[] | {time: .EventTime, api: .EventName, resource: .Resources}'
+```
+
+This shows the exact sequence of API calls, responses, and any errors that AWS returned — even if Terraform considered the apply successful.
+
+**Step 5 — Enable Terraform detailed logging.**
+
+```bash
+# Set log level to TRACE — extremely verbose, shows every API call and response
+export TF_LOG=TRACE
+export TF_LOG_PATH=/tmp/terraform-debug.log
+terraform apply
+
+# Check the log for errors
+grep -i "error\|failed\|denied" /tmp/terraform-debug.log
+
+# The log shows:
+# - Which API calls Terraform made
+# - The full request and response (including AWS error codes)
+# - How Terraform interpreted the response
+```
+
+**Step 6 — Common "apply succeeded but resource broken" scenarios.**
+
+**Scenario: Security Group applied but traffic still blocked.**
+
+```bash
+# Terraform applied the SG with correct rules, but it's attached to the wrong interface
+aws ec2 describe-instances \
+  --instance-ids <instance-id> \
+  --query 'Reservations[*].Instances[*].SecurityGroups'
+# Check: is the new SG in the list? Or is there a conflicting SG still attached?
+```
+
+**Scenario: IAM role applied but Lambda can't assume it.**
+
+```bash
+# Check trust policy on the role
+aws iam get-role --role-name my-lambda-role \
+  --query 'Role.AssumeRolePolicyDocument'
+
+# Terraform might have applied the role but with wrong trust policy format
+# JSON whitespace or ordering issues can cause trust policy rejection
+```
+
+**Scenario: RDS parameter group applied but DB still using old parameters.**
+
+```bash
+aws rds describe-db-instances --db-instance-identifier prod-postgres \
+  --query 'DBInstances[*].{PendingModified:PendingModifiedValues,DBParameterGroups:DBParameterGroups}'
+
+# "PendingModifiedValues" — the parameter is applied but requires a reboot
+# "DBParameterGroups.ParameterApplyStatus" = "pending-reboot" → needs reboot
+```
+
+Some RDS parameter changes require a reboot to take effect. Terraform applies the parameter group change but doesn't reboot — the database still uses old parameters until rebooted.
+
+**Step 7 — Use `terraform plan` again after debugging.**
+
+After investigating, run a new plan to see if Terraform's desired state now matches what you found:
+
+```bash
+terraform plan
+# "No changes" → state matches AWS reality, problem is post-configuration (app-level)
+# Shows changes → state diverged from AWS, terraform will reconcile on next apply
+```
+
+**Real scenario:** After a Terraform apply that added EKS node group autoscaling, pods were still not scheduling on new nodes. `terraform state show aws_eks_node_group.general` showed the right configuration. `aws eks describe-nodegroup` showed `"scalingConfig": {"minSize": 2, "maxSize": 10}` — correct. But pods weren't scheduling. The actual issue: the new node IAM role was applied, but the `aws-auth` ConfigMap in Kubernetes wasn't updated to trust the new role ARN. Terraform applied the AWS-side resources correctly, but the K8s-side ConfigMap update was in a separate module that hadn't been run yet. Running `terraform apply` on the EKS auth module resolved it. Lesson: Terraform apply per-module succeeded, but the full apply across modules was incomplete.
+
+---
+
+## 5. A production Terraform deployment failed halfway — some resources were created and others weren't. How do you recover?
+
+A partial apply is more dangerous than a clean failure. Some resources exist, some don't, and the state file may or may not reflect reality accurately. The recovery approach depends on which resources were created and what depends on what.
+
+**Step 1 — Understand what Terraform recorded in state.**
+
+```bash
+# What does Terraform think it created?
+terraform state list
+
+# Compare against the resources in your .tf files
+# Any resource in .tf but not in state → was not created or failed silently
+# Any resource in state but not in .tf → may have been orphaned
+```
+
+**Step 2 — Check AWS directly for resources that may or may not exist.**
+
+Don't trust only the state file. Verify against AWS:
+
+```bash
+# Example: EKS cluster — did it actually get created?
+aws eks describe-cluster --name prod-cluster 2>&1
+# "ResourceNotFoundException" → cluster doesn't exist (even if state has it)
+# Cluster details returned → it exists
+
+# Example: RDS instance — did it get created?
+aws rds describe-db-instances --db-instance-identifier prod-postgres 2>&1
+```
+
+**Step 3 — Run `terraform plan` to see what Terraform wants to do next.**
+
+```bash
+terraform plan
+```
+
+The plan output after a partial apply tells you exactly what's missing:
+- Resources Terraform wants to create → they don't exist yet (apply failed before creating them)
+- Resources Terraform wants to modify → they exist but need updates
+- Resources Terraform wants to destroy → they're in state but shouldn't exist per current .tf config
+
+**Step 4 — Fix any state inconsistencies before re-applying.**
+
+**Case A: Resource exists in AWS but not in state (Terraform would try to re-create it).**
+
+```bash
+# Import the existing resource into state
+terraform import aws_security_group.app sg-0abc1234def567890
+# Now Terraform knows it exists — plan will show "update" instead of "create"
+```
+
+**Case B: Resource is in state but doesn't actually exist in AWS (Terraform shows "update" but it would fail).**
+
+```bash
+# Remove from state — Terraform will try to create it on next apply
+terraform state rm aws_iam_role.broken_role
+# Then re-apply — Terraform creates it fresh
+```
+
+**Case C: Resource partially created in AWS (e.g., EKS cluster in CREATING state).**
+
+```bash
+# Check if the resource is still being created
+aws eks describe-cluster --name prod-cluster --query 'cluster.status'
+# "CREATING" → wait, it may complete on its own
+# "FAILED"   → it failed internally; may need to be deleted and recreated
+
+# If FAILED, delete via AWS CLI then re-apply
+aws eks delete-cluster --name prod-cluster
+# Wait for deletion, then re-apply Terraform
+```
+
+**Step 5 — Use `-target` to apply just the failed resources.**
+
+If you know which specific resources failed, apply only those:
+
+```bash
+# Apply only the resources that didn't get created
+terraform apply \
+  -target=aws_iam_role.lambda_exec \
+  -target=aws_lambda_function.order_processor
+
+# Verify those succeeded, then run a full apply
+terraform apply
+```
+
+`-target` is a recovery tool — don't use it as a regular workflow. A targeted apply can create state inconsistencies if the targeted resources have dependencies on non-targeted ones.
+
+**Step 6 — Address the root cause of the failure.**
+
+```bash
+# Check what caused the mid-apply failure
+terraform plan 2>&1 | tee /tmp/plan-output.txt
+grep -i "error" /tmp/plan-output.txt
+
+# Common root causes:
+# - IAM permission error: Terraform role missing permissions for a resource type
+# - API throttling: AWS throttled the request (retry usually fixes it)
+# - Quota exceeded: VPC limit, EIP limit, etc.
+# - Dependency cycle: resource A depends on B, B depends on A
+# - Invalid input: variable value not accepted by AWS API
+```
+
+For API throttling:
+
+```bash
+# Re-run the apply — throttled resources will succeed on retry
+# Add parallelism setting to reduce chance of throttling on large deployments
+terraform apply -parallelism=5    # Default is 10; lower = fewer concurrent API calls
+```
+
+**Step 7 — Restore state from S3 versioning if state is corrupt.**
+
+If the state file itself is corrupted or partially written:
+
+```bash
+# List state file versions in S3
+aws s3api list-object-versions \
+  --bucket my-terraform-state \
+  --prefix prod/main/terraform.tfstate \
+  --query 'Versions[*].[VersionId,LastModified]'
+
+# Restore the version from before the failed apply
+aws s3api copy-object \
+  --copy-source "my-terraform-state/prod/main/terraform.tfstate?versionId=<good-version-id>" \
+  --bucket my-terraform-state \
+  --key prod/main/terraform.tfstate
+
+# Now re-run terraform plan — state reflects pre-apply reality
+terraform plan
+```
+
+**Recovery checklist:**
+
+```
+1. terraform state list                  → what does Terraform think exists?
+2. Verify critical resources in AWS CLI  → do they actually exist?
+3. terraform import <resource> <id>      → re-import resources present in AWS but not in state
+4. terraform state rm <resource>         → remove resources that are in state but don't exist
+5. terraform apply -target=<resource>    → create only the failed resources
+6. terraform apply                       → full apply to verify everything is clean
+7. Fix the root cause (IAM, quota, throttling)
+```
+
+**Real scenario:** A Terraform apply that provisioned a new EKS cluster failed after creating the cluster and node groups, but before creating the Kubernetes RBAC resources (aws-auth ConfigMap update). The cluster existed in AWS. The state file was partially updated — it had the EKS cluster but not the RBAC config. Re-running `terraform apply` without fixing anything: Terraform tried to re-create the EKS cluster (it was in state, then the apply failure removed it from state mid-write). Fix: ran `terraform import aws_eks_cluster.main prod-cluster` to re-add the cluster to state, then `terraform apply` which correctly saw "cluster exists, just apply the missing RBAC resources." Full recovery in 12 minutes.

@@ -175,3 +175,5 @@ Executes the plan. Calls AWS/GCP/Azure APIs to create/modify/delete resources. U
 
 **`terraform destroy`**
 Destroys all resources in the state file. We never run this in production without first checking: does `prevent_destroy = true` protect critical resources? Is the state file pointing at the right environment? We've had an incident where someone ran `terraform destroy` in a directory they thought was staging but was prod. Now we add `prevent_destroy = true` to RDS and EKS resources.
+
+> **Also asked as:** "What does the terraform init command do?" — covered above (`terraform init` downloads provider plugins, initialises modules, and configures the backend).

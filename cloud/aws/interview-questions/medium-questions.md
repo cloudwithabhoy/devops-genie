@@ -281,6 +281,8 @@ The original AWS LB, now legacy. No path-based routing, limited features. Any CL
 
 **Key insight:** Don't choose NLB for "better performance" by default. If you need Layer 7 features (SSL termination, path routing, WAF, authentication), you need ALB. NLB is for specific use cases where Layer 4 is genuinely required.
 
+> **Also asked as:** "What is the difference between an L4 and L7 load balancer?" — L4 (NLB) routes by IP/TCP port only; L7 (ALB) reads HTTP headers, URLs, and cookies to make routing decisions. See `networking/basic-questions.md` for the pure networking concept.
+
 ---
 
 ## 4. How do you connect and manage services such as databases, EC2, EKS, and ECS?
@@ -716,6 +718,8 @@ Exceptions:
 
 **Real cost comparison:** Before consolidating, we had 6 ALBs (one per service) and 1 NLB. After: 1 ALB for HTTP services (path routing) + 1 NLB for TCP services. Saved $180/month in load balancer hourly charges. More importantly, WAF was only on 1 ALB instead of 6 — one rule update protects all services.
 
+> **Also asked as:** "When do you use ALB vs NLB?" — covered above (ALB for HTTP/HTTPS with L7 routing and WAF; NLB for TCP/UDP, static IP, ultra-low latency, or non-HTTP protocols).
+
 ---
 
 ## 10. What is AWS Auto Scaling Groups and what are its use cases?
@@ -862,6 +866,8 @@ resource "aws_autoscaling_lifecycle_hook" "terminating" {
 Before terminating an instance during scale-in, the lifecycle hook pauses and waits — giving the instance 5 minutes to finish processing any in-flight requests. Critical for worker processes that shouldn't be killed mid-job.
 
 **Real scenario:** Our batch processing workers ran on a fixed fleet of 10 EC2 instances. During month-end reporting, the queue had 50,000 jobs and 10 workers took 8 hours. We moved to an ASG scaling on SQS queue depth: 0 messages → 1 instance (cost: ~$0.10/hour). Queue depth > 1,000 → scale to 20 instances. Month-end processing finished in 40 minutes instead of 8 hours. Cost for that burst: $6 instead of running 10 instances 24/7 at $48/day.
+
+> **Also asked as:** "Explain a scenario where scheduled scaling is more appropriate than dynamic scaling." — covered above. Scheduled scaling fits predictable patterns: scale up at 08:00 before business hours, scale down at 20:00. Dynamic (target tracking) fits unpredictable load. Use scheduled when you know *when* load hits; use dynamic when you only know *if* it hits.
 
 ---
 

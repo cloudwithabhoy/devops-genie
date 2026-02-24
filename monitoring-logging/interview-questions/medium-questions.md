@@ -256,6 +256,8 @@ curl -X POST http://localhost:9093/api/v1/alerts \
 
 **Real scenario:** Alert fired — checkout conversion dropped by 8%.
 
+> **Also asked as:** "I want to configure alerting — disk usage of a server reaches 80%, it should alert SMS. Where do I do this configuration?" — covered above (Node Exporter → Prometheus alert rule → Alertmanager → AWS SNS / Twilio).
+
 ---
 
 ## 3. How do you create a monitoring dashboard for your organisation?
@@ -366,3 +368,458 @@ data:
 ```
 
 Store dashboards as JSON in Git. Use `grafana-dashboard-provisioner` to load them on startup. This way, dashboards are version-controlled and recreated automatically if Grafana is redeployed. Metrics showed payment service error rate was 0% (no errors). Logs showed payment service was completing successfully. Traces showed: every checkout request was making 4 sequential calls to the inventory service (N+1 query pattern introduced in the last deploy). Each call was fast (30ms), but 4 × 30ms = 120ms added to every checkout. Users were abandoning at the longer load time without errors being thrown. We'd have never found this from metrics or logs alone — it required traces to see the N+1 pattern across service calls.
+
+---
+
+## 4. How do you implement Kubernetes cluster-level monitoring using Prometheus?
+
+Kubernetes cluster monitoring has two layers: **infrastructure metrics** (nodes, pods, containers) and **workload metrics** (application-level RED signals). Prometheus covers both with the right exporters and scrape configuration.
+
+**The standard stack: kube-prometheus-stack.**
+
+The easiest production setup is the `kube-prometheus-stack` Helm chart, which bundles Prometheus, Alertmanager, Grafana, Node Exporter, kube-state-metrics, and pre-built dashboards:
+
+```bash
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+
+helm install kube-prometheus-stack \
+  prometheus-community/kube-prometheus-stack \
+  --namespace monitoring \
+  --create-namespace \
+  --values prometheus-values.yaml
+```
+
+**What gets installed automatically:**
+
+```
+kube-prometheus-stack
+├── prometheus-operator        ← manages Prometheus config via CRDs
+├── prometheus                 ← metrics storage and query engine
+├── alertmanager               ← alert routing and deduplication
+├── grafana                    ← dashboards and visualisation
+├── node-exporter (DaemonSet)  ← host metrics from every node
+└── kube-state-metrics         ← K8s object state (pod counts, deployment status)
+```
+
+**Key metrics each component provides:**
+
+```
+Node Exporter (per node):
+  node_cpu_seconds_total          → CPU usage per core per mode
+  node_memory_MemAvailable_bytes  → available memory
+  node_filesystem_avail_bytes     → disk space per mount
+  node_network_receive_bytes_total → network throughput
+
+kube-state-metrics (K8s objects):
+  kube_pod_status_phase           → how many pods in Running/Pending/Failed state
+  kube_deployment_status_replicas_available → available vs desired replicas
+  kube_pod_container_resource_limits → configured CPU/memory limits
+  kube_node_status_condition      → node Ready/NotReady/MemoryPressure
+
+cAdvisor (container-level, built into kubelet):
+  container_cpu_usage_seconds_total
+  container_memory_working_set_bytes
+  container_fs_usage_bytes
+```
+
+**Custom prometheus-values.yaml for production:**
+
+```yaml
+# prometheus-values.yaml
+prometheus:
+  prometheusSpec:
+    retention: 30d              # Keep 30 days of metrics
+    retentionSize: "50GB"       # Or until 50GB is reached (whichever first)
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 100Gi   # Adjust based on retention and cluster size
+
+    # Scrape all ServiceMonitors across all namespaces
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+
+alertmanager:
+  alertmanagerSpec:
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3
+          resources:
+            requests:
+              storage: 10Gi
+
+grafana:
+  adminPassword: "change-me-use-secret"
+  persistence:
+    enabled: true
+    storageClassName: gp3
+    size: 10Gi
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: default
+          orgId: 1
+          folder: "Kubernetes"
+          type: file
+          disableDeletion: false
+          options:
+            path: /var/lib/grafana/dashboards/default
+```
+
+**Scraping application metrics with ServiceMonitor.**
+
+Applications expose metrics on `/metrics` (Prometheus format). A `ServiceMonitor` tells Prometheus where to scrape:
+
+```yaml
+# serviceMonitor for your application
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: order-service
+  namespace: prod
+  labels:
+    release: kube-prometheus-stack   # Must match Prometheus' serviceMonitorSelector
+spec:
+  selector:
+    matchLabels:
+      app: order-service
+  endpoints:
+    - port: metrics      # The named port in your Service exposing /metrics
+      interval: 30s
+      path: /metrics
+```
+
+For pods without a Service (batch jobs, etc.), use `PodMonitor`:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: batch-worker
+  namespace: prod
+spec:
+  selector:
+    matchLabels:
+      app: batch-worker
+  podMetricsEndpoints:
+    - port: metrics
+      interval: 60s
+```
+
+**Essential cluster-level alerts.**
+
+```yaml
+# PrometheusRule — alert rules managed as K8s objects
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cluster-alerts
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: node-health
+      rules:
+        - alert: NodeNotReady
+          expr: kube_node_status_condition{condition="Ready",status="true"} == 0
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: "Node {{ $labels.node }} is not ready"
+
+        - alert: NodeMemoryPressure
+          expr: kube_node_status_condition{condition="MemoryPressure",status="true"} == 1
+          for: 2m
+          labels: { severity: warning }
+
+        - alert: NodeDiskPressure
+          expr: kube_node_status_condition{condition="DiskPressure",status="true"} == 1
+          for: 2m
+          labels: { severity: warning }
+
+    - name: workload-health
+      rules:
+        - alert: DeploymentReplicasMismatch
+          expr: |
+            kube_deployment_status_replicas_available
+            < kube_deployment_spec_replicas
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "Deployment {{ $labels.deployment }} has fewer replicas than desired"
+
+        - alert: PodCrashLooping
+          expr: |
+            increase(kube_pod_container_status_restarts_total[1h]) > 5
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "Pod {{ $labels.pod }} is crash looping"
+
+        - alert: PodOOMKilled
+          expr: |
+            kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1
+          for: 0m
+          labels: { severity: warning }
+```
+
+**Grafana dashboards — pre-built for K8s.**
+
+kube-prometheus-stack includes the Kubernetes Mixin dashboards automatically. Access them at:
+- `Kubernetes / Nodes` — per-node CPU, memory, disk, network
+- `Kubernetes / Pods` — per-pod resource usage and restarts
+- `Kubernetes / Workloads` — deployments, DaemonSets, StatefulSets health
+
+**Scaling Prometheus for large clusters:**
+
+For clusters with 100+ nodes and 1000+ pods, single Prometheus can struggle:
+
+```yaml
+# Option 1: Thanos sidecar — long-term storage + global queries across multiple Prometheus
+prometheus:
+  prometheusSpec:
+    thanos:
+      objectStorageConfig:
+        key: thanos.yaml
+        name: thanos-objstore-config
+      # Thanos sidecar uploads metrics blocks to S3 for long-term retention
+
+# Option 2: Prometheus Operator with sharding
+prometheus:
+  prometheusSpec:
+    shards: 3   # Split scraping across 3 Prometheus instances
+```
+
+**Real scenario:** We set up kube-prometheus-stack on an EKS cluster with 40 nodes and 200+ pods. Initial setup took 20 minutes. Within an hour, Prometheus had scraped all nodes and pods. The first alert that fired: `PodCrashLooping` for a payment-service pod that was crashing due to a misconfigured environment variable. Without monitoring, we'd have found out from a user complaint. With monitoring, we fixed it in 8 minutes of being alerted — before any user noticed.
+
+---
+
+## 5. How can you integrate Prometheus with Alertmanager and Slack for real-time notifications?
+
+The Prometheus → Alertmanager → Slack pipeline sends a Slack message when a metric breaches a threshold. Each component has a specific role: Prometheus evaluates, Alertmanager routes and deduplicates, Slack delivers.
+
+**The pipeline:**
+
+```
+Prometheus (evaluates alert rules every 15s)
+    ↓ alert fires if condition true for `for:` duration
+Alertmanager (groups, deduplicates, routes)
+    ↓ matches route → sends to Slack receiver
+Slack channel (formatted notification)
+```
+
+**Step 1 — Create a Slack incoming webhook.**
+
+In Slack:
+1. Go to `api.slack.com/apps` → Create New App → From scratch
+2. Enable **Incoming Webhooks** → Add New Webhook to Workspace
+3. Choose a channel → Copy the webhook URL: `https://hooks.slack.com/services/T.../B.../xxx`
+
+Store the webhook URL as a Kubernetes secret:
+
+```bash
+kubectl create secret generic alertmanager-slack-webhook \
+  --from-literal=webhook-url="https://hooks.slack.com/services/T.../B.../xxx" \
+  -n monitoring
+```
+
+**Step 2 — Configure Alertmanager routing.**
+
+```yaml
+# alertmanager.yml (or AlertmanagerConfig CRD in kube-prometheus-stack)
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: "default-slack"        # Default: all alerts go to Slack
+  group_by: ["alertname", "namespace"]  # Group related alerts together
+  group_wait: 30s                  # Wait 30s to collect related alerts before sending
+  group_interval: 5m               # Wait 5m before sending new alerts in same group
+  repeat_interval: 4h              # Resend unresolved alert every 4 hours
+
+  routes:
+    # Critical alerts → immediate Slack + PagerDuty
+    - match:
+        severity: critical
+      receiver: "critical-alerts"
+      continue: true               # Also evaluate following routes
+
+    # Warning alerts → Slack only
+    - match:
+        severity: warning
+      receiver: "warning-slack"
+
+    # Database alerts → separate channel
+    - match:
+        team: database
+      receiver: "db-slack"
+
+receivers:
+  - name: "default-slack"
+    slack_configs:
+      - api_url: "https://hooks.slack.com/services/T.../B.../xxx"
+        channel: "#alerts"
+        send_resolved: true        # Send "resolved" message when alert clears
+        color: '{{ if eq .Status "firing" }}danger{{ else }}good{{ end }}'
+        title: '{{ template "slack.default.title" . }}'
+        text: '{{ range .Alerts }}*Alert:* {{ .Annotations.summary }}\n*Severity:* {{ .Labels.severity }}\n*Description:* {{ .Annotations.description }}\n{{ end }}'
+
+  - name: "critical-alerts"
+    slack_configs:
+      - api_url: "https://hooks.slack.com/services/T.../B.../xxx"
+        channel: "#critical-alerts"
+        send_resolved: true
+    pagerduty_configs:
+      - routing_key: <pagerduty-integration-key>
+        description: '{{ .GroupLabels.alertname }}: {{ .Annotations.summary }}'
+
+  - name: "warning-slack"
+    slack_configs:
+      - api_url: "https://hooks.slack.com/services/T.../B.../xxx"
+        channel: "#alerts-warning"
+        send_resolved: true
+
+  - name: "db-slack"
+    slack_configs:
+      - api_url: "https://hooks.slack.com/services/T.../B.../xxx"
+        channel: "#database-alerts"
+
+inhibit_rules:
+  # If a critical alert is firing, suppress the corresponding warning
+  - source_match:
+      severity: critical
+    target_match:
+      severity: warning
+    equal: ["alertname", "namespace"]
+```
+
+**Step 3 — Define alert rules in Prometheus.**
+
+```yaml
+# PrometheusRule CRD (kube-prometheus-stack)
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: application-alerts
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: application
+      rules:
+        - alert: HighErrorRate
+          expr: |
+            rate(http_requests_total{status=~"5.."}[5m])
+            /
+            rate(http_requests_total[5m]) * 100 > 5
+          for: 5m
+          labels:
+            severity: critical
+            team: application
+          annotations:
+            summary: "High error rate on {{ $labels.service }}"
+            description: "Error rate is {{ $value | printf \"%.1f\" }}% on {{ $labels.service }} (threshold: 5%)"
+            runbook: "https://wiki.company.com/runbooks/high-error-rate"
+
+        - alert: HighLatency
+          expr: |
+            histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 2
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High p95 latency on {{ $labels.service }}"
+            description: "p95 latency is {{ $value | printf \"%.2f\" }}s on {{ $labels.service }}"
+```
+
+**Step 4 — Apply Alertmanager config via kube-prometheus-stack (Kubernetes secret).**
+
+```yaml
+# When using kube-prometheus-stack, provide config via values.yaml
+alertmanager:
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      receiver: default-slack
+      group_by: [alertname, namespace]
+      routes: [...]
+    receivers:
+      - name: default-slack
+        slack_configs:
+          - api_url:
+              # Reference the Kubernetes secret we created
+              secretKeyRef:
+                name: alertmanager-slack-webhook
+                key: webhook-url
+            channel: "#alerts"
+            send_resolved: true
+```
+
+**Step 5 — Test the integration without waiting for a real alert.**
+
+```bash
+# Send a test alert directly to Alertmanager
+curl -X POST http://alertmanager.monitoring.svc.cluster.local:9093/api/v1/alerts \
+  -H "Content-Type: application/json" \
+  -d '[{
+    "labels": {
+      "alertname": "TestAlert",
+      "severity": "warning",
+      "service": "test-service"
+    },
+    "annotations": {
+      "summary": "This is a test alert",
+      "description": "Testing Alertmanager → Slack pipeline"
+    },
+    "generatorURL": "http://prometheus.monitoring.svc.cluster.local:9090"
+  }]'
+
+# Check Alertmanager UI to confirm it received the alert:
+# kubectl port-forward svc/kube-prometheus-stack-alertmanager 9093:9093 -n monitoring
+# Open: http://localhost:9093
+```
+
+**What a good Slack alert looks like:**
+
+```
+🔴 [FIRING] HighErrorRate — prod/order-service
+
+Alert: High error rate on order-service
+Severity: critical
+Description: Error rate is 8.3% on order-service (threshold: 5%)
+Runbook: https://wiki.company.com/runbooks/high-error-rate
+
+Started: 14:32 UTC (5 minutes ago)
+Labels: namespace=prod, service=order-service
+```
+
+Include the runbook link in every alert — on-call engineers know exactly where to look.
+
+**Common Alertmanager problems and fixes:**
+
+```bash
+# Alert firing in Prometheus but not appearing in Slack?
+# 1. Check Alertmanager received it:
+curl http://localhost:9093/api/v1/alerts
+
+# 2. Check Alertmanager routing:
+# Alertmanager UI → Status → Routing → shows which receiver will handle the alert
+
+# 3. Check Alertmanager logs for Slack API errors:
+kubectl logs -n monitoring alertmanager-kube-prometheus-stack-alertmanager-0
+
+# Common error: "context deadline exceeded" → Slack webhook URL wrong or rotated
+# Common error: "no receivers defined" → route doesn't match alert labels
+```
+
+**Real scenario:** We had Prometheus alerts firing but nobody being notified — the alerts were in Prometheus UI but engineers only saw them during weekly reviews. After setting up the Alertmanager → Slack pipeline: the first week, 12 alerts fired that the team had never seen before. 3 were noise (tuned away). 9 were real issues: 2 memory leaks, 1 disk filling on a logging node, 4 intermittent connection pool exhaustions, 2 pods with high restart counts. All resolved within hours of being alerted — instead of discovered days later during user escalations. Mean Time To Detect (MTTD) dropped from 4 hours to 8 minutes.

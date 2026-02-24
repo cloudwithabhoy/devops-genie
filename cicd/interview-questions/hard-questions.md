@@ -473,6 +473,8 @@ post {
 
 **Real scenario:** We had zero-downtime configured everywhere but still saw 0.1% 502s during deploys. Added nginx access log analysis: errors correlated exactly with pod termination events. Root cause: our NGINX ingress had a 30-second upstream keepalive timeout, but pod `preStop` sleep was only 5 seconds. Pods were terminating before NGINX cleared the keepalive connection. Fix: increased `preStop` sleep to 15 seconds (> NGINX keepalive). 502s during deploys dropped to zero.
 
+> **Also asked as:** "How would you ensure zero-downtime deployment during a critical update?" — covered above (rolling update strategy, readiness probes, preStop hook, PodDisruptionBudget, Blue/Green for critical services).
+
 ---
 
 ## 4. How do you integrate security scans (SAST/DAST) as part of the CI/CD flow?
@@ -607,6 +609,8 @@ Before prod approval:
 ```
 
 **Real impact:** We added Trivy to the pipeline when log4shell (CVE-2021-44228) hit. Within 2 hours of the CVE being published, every new build of our Java services failed the Trivy scan. We rebuilt with the patched log4j version, all services updated by end of day. Without pipeline scanning, we'd have found out weeks later when a security researcher or attacker told us.
+
+> **Also asked as:** "How do you design a CI/CD pipeline for a secure deployment?" — covered above (SAST for code, Trivy for images, DAST for running app, secrets scanning, manual gate before prod).
 
 ---
 

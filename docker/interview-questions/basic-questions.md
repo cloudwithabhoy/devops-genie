@@ -430,3 +430,139 @@ docker run -d -p 8080:80 -v /host/data:/container/data nginx:latest
 | Lifecycle | Created by `docker build` | Created by `docker run` |
 | Multiplicity | One image | Many containers from one image |
 | Data | Immutable | Changes lost when container removed (use volumes) |
+
+---
+
+## 8. What is the difference between CMD and ENTRYPOINT in a Dockerfile?
+
+Both define what runs when a container starts — but they behave differently when arguments are passed to `docker run`.
+
+**CMD — default command, easily overridden.**
+
+```dockerfile
+FROM ubuntu
+CMD ["echo", "Hello World"]
+```
+
+```bash
+docker run myimage                  # Output: Hello World
+docker run myimage echo "Override"  # Output: Override  ← CMD is replaced entirely
+```
+
+CMD sets the default command. Anything passed after the image name in `docker run` **completely replaces** CMD.
+
+**ENTRYPOINT — fixed executable, arguments appended.**
+
+```dockerfile
+FROM ubuntu
+ENTRYPOINT ["echo"]
+```
+
+```bash
+docker run myimage                   # Output: (blank — no argument)
+docker run myimage "Hello World"     # Output: Hello World  ← argument appended to ENTRYPOINT
+docker run myimage "Override"        # Output: Override
+```
+
+Arguments passed to `docker run` are **appended** to ENTRYPOINT, not replacing it. The container always runs `echo` — you can only change what it echoes.
+
+**Using both together — the most common pattern:**
+
+```dockerfile
+ENTRYPOINT ["python", "app.py"]   # Fixed executable
+CMD ["--port", "8080"]            # Default arguments (overridable)
+```
+
+```bash
+docker run myimage                         # Runs: python app.py --port 8080
+docker run myimage --port 3000             # Runs: python app.py --port 3000  ← CMD overridden
+docker run --entrypoint /bin/sh myimage    # Overrides ENTRYPOINT (requires --entrypoint flag)
+```
+
+**Real use case — ENTRYPOINT as a wrapper script:**
+
+```dockerfile
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["start"]
+```
+
+```bash
+#!/bin/sh
+# entrypoint.sh — runs setup before handing off to CMD
+echo "Starting up..."
+exec "$@"   # Executes whatever CMD (or docker run args) specifies
+```
+
+**Summary:**
+
+| | CMD | ENTRYPOINT |
+|---|---|---|
+| Purpose | Default arguments / command | Fixed executable |
+| Override | `docker run image <new-cmd>` | `docker run --entrypoint <new> image` |
+| Combined | CMD provides default args to ENTRYPOINT | ENTRYPOINT receives CMD as arguments |
+| Preferred form | `["cmd", "arg"]` (exec form) | `["executable"]` (exec form) |
+
+Always use **exec form** (`["executable", "arg"]`) not shell form (`executable arg`) — shell form runs through `/bin/sh -c` which doesn't handle signals correctly and can cause issues with graceful shutdown.
+
+---
+
+## 9. What is the purpose of a base image in Docker?
+
+A base image is the starting layer of your Docker image — specified in the `FROM` instruction. Every subsequent instruction builds on top of it. The base image provides the OS filesystem, core utilities, and often a runtime (Python, Node, Java) so you don't start from scratch.
+
+```dockerfile
+FROM python:3.12-slim   # Base image: Debian slim + Python 3.12 pre-installed
+WORKDIR /app
+COPY . .
+RUN pip install -r requirements.txt
+CMD ["python", "app.py"]
+```
+
+Without the base image, you'd need to install Python, pip, SSL libraries, and every dependency manually from a bare OS — hundreds of lines of setup for every image.
+
+**Common base images and when to use them:**
+
+| Base image | Size | Use case |
+|---|---|---|
+| `ubuntu:24.04` | ~80MB | General purpose, familiar tooling |
+| `debian:bookworm-slim` | ~75MB | Slim Debian, good compatibility |
+| `alpine:3.19` | ~7MB | Minimal, use when size matters |
+| `python:3.12-slim` | ~130MB | Python apps |
+| `node:20-alpine` | ~120MB | Node.js apps |
+| `openjdk:21-slim` | ~220MB | Java apps |
+| `scratch` | 0MB | Compiled Go/Rust binaries (no OS at all) |
+
+**Why base image choice matters:**
+
+```dockerfile
+# Large base image — 1.1GB
+FROM python:3.12
+# vs
+# Slim variant — 130MB (same Python, fewer OS packages)
+FROM python:3.12-slim
+# vs
+# Alpine — ~50MB (musl libc instead of glibc — may break native extensions)
+FROM python:3.12-alpine
+```
+
+Smaller base images mean:
+- Faster image pulls in CI/CD and at deployment
+- Smaller attack surface (fewer packages = fewer CVEs)
+- Lower ECR/registry storage costs
+
+**Official vs custom base images:**
+
+In organisations, teams often build a **golden base image** — an internal image pre-loaded with security patches, company CA certificates, monitoring agents, and approved packages:
+
+```dockerfile
+# Company golden base image
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y ca-certificates curl && apt-get clean
+COPY company-ca.crt /usr/local/share/ca-certificates/
+RUN update-ca-certificates
+# Teams use this instead of ubuntu:24.04 directly
+```
+
+This ensures all containers trust internal TLS certificates and have security baselines applied, without each team managing it themselves.

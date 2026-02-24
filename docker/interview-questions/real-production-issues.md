@@ -352,3 +352,270 @@ spec:
 ```
 
 **Real scenario:** We had a `log4shell` (CVE-2021-44228) moment — a critical CVE published on a Tuesday affected every Java image in our entire registry. Without continuous scanning, we'd have found out when a security researcher told us. With ECR Enhanced Scanning, we got a Slack alert within 2 hours of the CVE being published. By end of day, we had rebuilt and redeployed all affected Java services. Zero breach, zero audit finding. The investment in scanning infrastructure paid for itself in one incident.
+
+---
+
+## 4. How do you handle image cleanup to prevent disk space issues?
+
+Docker images, stopped containers, unused volumes, and dangling layers accumulate over time and fill up the host disk. Left unmanaged, a full disk causes build failures, container crashes, and deployment failures.
+
+**Check current disk usage.**
+
+```bash
+docker system df
+# TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE
+# Images          47        12        18.3GB    14.1GB (77%)
+# Containers      3         3         2.5MB     0B (0%)
+# Local Volumes   8         5         4.2GB     1.1GB (26%)
+# Build Cache     -         -         3.8GB     3.8GB
+```
+
+**Clean up manually — targeted commands.**
+
+```bash
+# Remove dangling images (untagged, <none>:<none>)
+docker image prune
+
+# Remove all unused images (not referenced by any container)
+docker image prune -a
+
+# Remove stopped containers
+docker container prune
+
+# Remove unused volumes
+docker volume prune
+
+# Remove unused networks
+docker network prune
+
+# Remove everything unused at once (images, containers, volumes, networks, build cache)
+docker system prune -a --volumes
+```
+
+**Automate cleanup with a cron job.**
+
+```bash
+# /etc/cron.d/docker-cleanup
+# Run every Sunday at 2 AM — remove images older than 7 days
+0 2 * * 0 root docker image prune -a --force --filter "until=168h"
+
+# Remove stopped containers and dangling images daily
+0 3 * * * root docker system prune --force --filter "until=24h"
+```
+
+**In CI/CD — clean up after each build.**
+
+```yaml
+# GitHub Actions
+- name: Build image
+  run: docker build -t myapp:${{ github.sha }} .
+
+- name: Push image
+  run: docker push myapp:${{ github.sha }}
+
+- name: Cleanup local image
+  if: always()
+  run: docker image rm myapp:${{ github.sha }} || true
+```
+
+**In ECR — lifecycle policies to delete old images automatically.**
+
+```json
+{
+  "rules": [
+    {
+      "rulePriority": 1,
+      "description": "Keep last 10 tagged images",
+      "selection": {
+        "tagStatus": "tagged",
+        "tagPrefixList": ["v"],
+        "countType": "imageCountMoreThan",
+        "countNumber": 10
+      },
+      "action": { "type": "expire" }
+    },
+    {
+      "rulePriority": 2,
+      "description": "Delete untagged images older than 1 day",
+      "selection": {
+        "tagStatus": "untagged",
+        "countType": "sinceImagePushed",
+        "countUnit": "days",
+        "countNumber": 1
+      },
+      "action": { "type": "expire" }
+    }
+  ]
+}
+```
+
+**Real scenario:** A Jenkins build agent ran out of disk at 95% — the root cause was 3 months of accumulated Docker layers from builds that weren't cleaned up. No image pruning was configured. Emergency fix: `docker system prune -a --volumes --force` reclaimed 42GB. Permanent fix: added daily `docker system prune --filter "until=48h"` cron, and ECR lifecycle policies to expire untagged images after 1 day.
+
+---
+
+## 5. How do you troubleshoot container DNS resolution failures?
+
+DNS failures inside containers cause "service not found" errors that look like network or application bugs. The root cause is usually one of: wrong DNS server, missing search domain, CoreDNS misconfiguration (in K8s), or a firewall blocking port 53.
+
+**Step 1 — Confirm it's DNS, not a general network failure.**
+
+```bash
+# Inside the failing container
+docker exec -it <container-id> sh
+
+# Test DNS resolution
+nslookup google.com
+# "Server:         127.0.0.11" (Docker's embedded DNS) → DNS server is reachable
+# "connection timed out; no servers could be reached" → DNS server not reachable
+
+# Test using a specific DNS server directly
+nslookup google.com 8.8.8.8
+# If this works but the previous didn't → problem is with Docker's DNS, not network
+```
+
+**Step 2 — Check the container's DNS configuration.**
+
+```bash
+# See what DNS server and search domains the container is using
+cat /etc/resolv.conf
+# nameserver 127.0.0.11        ← Docker embedded DNS (default)
+# nameserver 169.254.169.253   ← AWS VPC DNS (if custom DNS configured)
+# search ap-south-1.compute.internal   ← search domain for AWS EC2 internal hostnames
+# options ndots:5              ← how many dots needed before searching absolute name
+```
+
+**Step 3 — Test resolution from outside the container.**
+
+```bash
+# From the Docker host, can it resolve?
+dig google.com
+nslookup google.com
+
+# If the host resolves but the container doesn't:
+# → Container's DNS is misconfigured (not using host's resolver)
+# → Docker network's DNS is isolated from the host
+```
+
+**Step 4 — Check Docker daemon DNS settings.**
+
+Docker's embedded DNS server (`127.0.0.11`) forwards upstream to the DNS servers from the host's `/etc/resolv.conf` at daemon start time. If the host's DNS changed after Docker started, the daemon may have stale DNS servers.
+
+```bash
+# Check what Docker daemon is using as upstream DNS
+docker network inspect bridge | grep -A 5 '"Options"'
+# Look for: "com.docker.network.bridge.host_binding_ipv4"
+
+# Check daemon configuration
+cat /etc/docker/daemon.json
+# May show: {"dns": ["8.8.8.8", "8.8.4.4"]}
+# If this is wrong or missing, daemon uses host /etc/resolv.conf
+```
+
+**Common fix — set explicit DNS in daemon.json:**
+
+```json
+// /etc/docker/daemon.json
+{
+  "dns": ["169.254.169.253", "8.8.8.8"],
+  "dns-search": ["ap-south-1.compute.internal"]
+}
+```
+
+```bash
+# Apply the daemon config change
+sudo systemctl restart docker
+# Note: this restarts all running containers
+```
+
+**Step 5 — Check for `ndots` misconfiguration (Kubernetes).**
+
+In Kubernetes, the default `ndots: 5` causes every DNS lookup to first try multiple search domain suffixes before falling through to the absolute name. A lookup for `api.external.com` with `ndots:5` tries:
+
+```
+api.external.com.default.svc.cluster.local (fails)
+api.external.com.svc.cluster.local (fails)
+api.external.com.cluster.local (fails)
+api.external.com.ap-south-1.compute.internal (fails)
+api.external.com (succeeds — but after 4 failed lookups)
+```
+
+This adds 4 extra DNS queries for every external hostname, increasing latency and putting load on CoreDNS.
+
+```yaml
+# Fix: override ndots for pods that mostly call external services
+spec:
+  dnsConfig:
+    options:
+      - name: ndots
+        value: "2"    # Only 2 search domain attempts before trying absolute
+```
+
+**Step 6 — Kubernetes: check CoreDNS.**
+
+In Kubernetes, all pod DNS goes through CoreDNS. If CoreDNS is failing:
+
+```bash
+# Check CoreDNS pods
+kubectl get pods -n kube-system -l k8s-app=kube-dns
+# If pods are CrashLoopBackOff or not running → DNS down for all pods
+
+# Check CoreDNS logs
+kubectl logs -n kube-system -l k8s-app=kube-dns --tail=50
+
+# Test from inside a pod
+kubectl run -it --rm debug --image=busybox --restart=Never -- sh
+nslookup kubernetes.default.svc.cluster.local
+# Should return the ClusterIP of the kubernetes service
+# If this fails → CoreDNS issue
+nslookup google.com
+# If internal resolves but external doesn't → CoreDNS upstream forwarder issue
+```
+
+**Fix CoreDNS if it's crashing:**
+
+```bash
+# Most common CoreDNS crash: misconfigured Corefile (e.g., after manual edit)
+kubectl describe configmap coredns -n kube-system
+# Look for syntax errors in the Corefile
+
+# Restore CoreDNS to default config (if you accidentally broke it)
+kubectl rollout restart deployment coredns -n kube-system
+```
+
+**Step 7 — Check Security Groups and NACLs (port 53).**
+
+DNS runs on port 53 (UDP and TCP). Security Groups or NACLs blocking port 53 outbound will silently prevent all DNS resolution:
+
+```bash
+# From the container (or host), test that port 53 is reachable
+nc -zuv 169.254.169.253 53    # AWS VPC DNS — should succeed
+# Or:
+dig @169.254.169.253 google.com
+
+# If nc or dig times out but the IP is pingable → port 53 blocked by SG/NACL
+```
+
+```bash
+# Check the VPC NACL — does it allow port 53 outbound (and ephemeral ports inbound)?
+aws ec2 describe-network-acls \
+  --filter Name=association.subnet-id,Values=<subnet-id>
+```
+
+**Decision tree for container DNS failures:**
+
+```
+Container can't resolve hostname
+    ↓
+nslookup from inside container fails?
+    ↓ Yes
+  Does nslookup <hostname> 8.8.8.8 work?
+      ↓ Yes → Docker embedded DNS (127.0.0.11) is broken → restart Docker daemon
+      ↓ No  → Network issue (port 53 blocked or no internet)
+              → Check SG/NACL for port 53 UDP/TCP
+    ↓ No (resolution works but gets wrong IP)
+  cat /etc/resolv.conf → is search domain correct?
+  In K8s: is CoreDNS returning correct ClusterIP for internal services?
+    ↓ CoreDNS pods not running → restore CoreDNS deployment
+```
+
+**Real scenario:** A Node.js service in EKS was intermittently failing to connect to an external payment API. The errors were "ENOTFOUND api.payment-provider.com" — appearing 1% of the time. The issue: CoreDNS was saturated during traffic spikes. The node.js app used `dns.lookup()` which made a separate DNS query for every connection. 500 requests/second × 4 failed ndots lookups per external hostname = CoreDNS overwhelmed. Fixes applied: reduced `ndots` from 5 to 2, added CoreDNS HPA (`min: 2, max: 6 replicas`), switched the payment client to connection pooling (reuses TCP connections, eliminating repeated DNS lookups). DNS errors dropped to zero.

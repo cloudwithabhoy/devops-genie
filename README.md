@@ -18,7 +18,7 @@
 | [Monitoring & Logging](./monitoring-logging/) | [→](./monitoring-logging/cheatsheets/cheatsheet.md) | [→](./monitoring-logging/interview-questions/questions.md) | [→](./monitoring-logging/learning-material/notes.md) | [→](./monitoring-logging/projects/project-ideas.md) | [→](./monitoring-logging/resources/links.md) |
 | [Security](./security/) | [→](./security/cheatsheets/cheatsheet.md) | [→](./security/interview-questions/questions.md) | [→](./security/learning-material/notes.md) | [→](./security/projects/project-ideas.md) | [→](./security/resources/links.md) |
 | [Git](./git/) | [→](./git/cheatsheets/cheatsheet.md) | [→](./git/interview-questions/questions.md) | [→](./git/learning-material/notes.md) | [→](./git/projects/project-ideas.md) | [→](./git/resources/links.md) |
-| [Scripting (Bash & Python)](./scripting/) | [→](./scripting/cheatsheets/cheatsheet.md) | [→](./scripting/interview-questions/questions.md) | [→](./scripting/learning-material/notes.md) | [→](./scripting/projects/project-ideas.md) | [→](./scripting/resources/links.md) |
+| [Scripting (Bash & Python)](scripting languages/) | [→](scripting languages/cheatsheets/cheatsheet.md) | [→](scripting languages/interview-questions/questions.md) | [→](scripting languages/learning-material/notes.md) | [→](scripting languages/projects/project-ideas.md) | [→](scripting languages/resources/links.md) |
 
 ---
 

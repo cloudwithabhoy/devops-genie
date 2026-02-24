@@ -441,3 +441,292 @@ aws ec2 describe-security-groups --group-ids <target-sg-id>
 ```
 
 **Real scenario:** A new service was deployed and the browser showed "This site can't be reached." DNS resolved correctly — dig returned the ALB CNAME. curl to the ALB returned a connection timeout. The ALB listener was configured (port 443). The issue: the engineer had created a new target group and attached it to the ALB, but the target group used port 8080. The pod was listening on port 3000 (the Dockerfile's EXPOSE was 3000, but the Helm chart defaulted to 8080). The ALB was routing to port 8080 → connection refused from pods on port 3000 → ALB returned 502. Fix: updated the Helm chart's `service.targetPort` to 3000. Service was up in 2 minutes.
+
+---
+
+## 4. How would you migrate a running EC2 instance to another region with minimal downtime?
+
+EC2 instances are AZ and region-locked — you can't move a running instance. Migration is a create-in-destination, cutover, retire-source sequence. The goal is to minimise the cutover window to minutes, not hours.
+
+**Step 1 — Create an AMI (golden image) from the running instance.**
+
+```bash
+# Create an AMI — this snapshots the root EBS volume while the instance runs
+aws ec2 create-image \
+  --instance-id i-0abc1234def56789 \
+  --name "myapp-migration-$(date +%Y%m%d)" \
+  --description "Pre-migration snapshot for region move" \
+  --no-reboot    # Take image without stopping the instance (may have slight inconsistency)
+  # Omit --no-reboot for a fully consistent image (instance reboots briefly)
+
+# Note the returned AMI ID
+# ami-0a1b2c3d4e5f67890
+```
+
+`--no-reboot` means the instance keeps serving traffic during the snapshot. For databases or stateful apps, consider stopping writes briefly and using a reboot for full consistency.
+
+**Step 2 — Copy the AMI to the destination region.**
+
+AMIs are region-specific. Use `copy-image` to replicate it:
+
+```bash
+# Copy the AMI from ap-south-1 to ap-southeast-1
+aws ec2 copy-image \
+  --source-region ap-south-1 \
+  --source-image-id ami-0a1b2c3d4e5f67890 \
+  --region ap-southeast-1 \
+  --name "myapp-migration-ap-southeast-1" \
+  --encrypted    # Encrypt in the destination region using the default KMS key
+
+# This copies the AMI and all its snapshots — can take 15–60 minutes for large volumes
+# Check status:
+aws ec2 describe-images --region ap-southeast-1 \
+  --image-ids ami-<new-id> \
+  --query 'Images[*].State'
+# Wait for: "available"
+```
+
+**Step 3 — Launch a new instance in the destination region from the copied AMI.**
+
+```bash
+# Launch in ap-southeast-1 using the same instance type and config as source
+aws ec2 run-instances \
+  --region ap-southeast-1 \
+  --image-id ami-<new-copied-ami> \
+  --instance-type m5.large \
+  --subnet-id subnet-<dest-private-subnet> \
+  --security-group-ids sg-<dest-sg> \
+  --iam-instance-profile Name=myapp-role \
+  --key-name my-keypair \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=myapp-prod-new}]'
+```
+
+**Step 4 — Validate the new instance before switching traffic.**
+
+```bash
+# SSH into the new instance and verify the app is running correctly
+ssh -i my-keypair.pem ec2-user@<new-instance-private-ip>
+systemctl status myapp
+curl http://localhost:8080/health    # Internal health check
+
+# Run smoke tests against the new instance directly (bypassing DNS)
+curl -H "Host: api.myapp.com" http://<new-instance-ip>/api/status
+```
+
+Do not switch traffic until you're confident the new instance is healthy. This validation can run in parallel while the source instance continues serving.
+
+**Step 5 — Cutover: switch traffic to the new region.**
+
+**If using Route53:**
+
+```bash
+# Update the A record to point at the new region's IP or ALB
+aws route53 change-resource-record-sets \
+  --hosted-zone-id <zone-id> \
+  --change-batch '{
+    "Changes": [{
+      "Action": "UPSERT",
+      "ResourceRecordSet": {
+        "Name": "api.myapp.com",
+        "Type": "A",
+        "TTL": 60,
+        "ResourceRecords": [{"Value": "<new-region-alb-ip>"}]
+      }
+    }]
+  }'
+```
+
+Pre-lower the TTL before migration day (set to 60 seconds a day in advance). When TTL was 300+ seconds, DNS propagation takes 5 minutes after cutover. With TTL=60, propagation happens in ~1 minute.
+
+**Step 6 — Monitor the new instance post-cutover.**
+
+```bash
+# Watch error rate in the new region for 15 minutes
+# Watch the old instance — is traffic dropping to zero?
+watch -n 10 "aws cloudwatch get-metric-statistics \
+  --namespace AWS/EC2 \
+  --metric-name NetworkIn \
+  --dimensions Name=InstanceId,Value=i-0abc1234def56789 \
+  --period 60 --statistics Sum \
+  --start-time $(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%S) \
+  --end-time $(date -u +%Y-%m-%dT%H:%M:%S)"
+```
+
+**Step 7 — Keep the old instance for a rollback window.**
+
+Don't terminate the old instance immediately. Keep it running (stopped to save cost) for 24–48 hours. If the new instance has issues, you can route traffic back instantly.
+
+```bash
+# Stop the old instance (saves 95% of cost vs running, keeps EBS)
+aws ec2 stop-instances --instance-ids i-0abc1234def56789
+
+# Terminate after validation period
+aws ec2 terminate-instances --instance-ids i-0abc1234def56789
+```
+
+**For data-bearing instances (RDS is in a different class):**
+
+If the EC2 instance runs a database directly (not managed RDS), you need to sync data during the migration window:
+
+```bash
+# Replicate data using rsync between old and new instances (continuous sync during migration)
+rsync -avz --delete \
+  -e "ssh -i my-keypair.pem" \
+  /var/lib/mysql/ \
+  ec2-user@<new-instance-ip>:/var/lib/mysql/
+
+# Final rsync at cutover (catches the delta written during the initial sync)
+# Then stop writes on old → final rsync → start new → switch DNS
+```
+
+**Real scenario:** We migrated a stateless Node.js app from `us-east-1` to `ap-south-1` to reduce latency for Indian users. AMI creation: 4 minutes. AMI copy to `ap-south-1`: 22 minutes. New instance launch and app start: 6 minutes. Validation: 10 minutes. Cutover (DNS change with pre-lowered TTL=60): 90 seconds visible to users. Old instance stopped after 24 hours of monitoring. Total user-visible downtime: under 2 minutes.
+
+---
+
+## 5. Your S3 bucket storing critical backups becomes unavailable — how would you recover?
+
+"Unavailable" in S3 has different meanings — S3 itself is rarely down (99.999999999% durability, 99.99% availability), so "unavailable" usually means: objects were accidentally deleted, the bucket was deleted, access was revoked, or data was corrupted.
+
+**Step 1 — Diagnose the exact failure mode.**
+
+```bash
+# Can you list the bucket at all?
+aws s3 ls s3://prod-backups/
+
+# Error types and what they mean:
+# "NoSuchBucket"       → bucket was deleted (most serious)
+# "AccessDenied"       → IAM permissions or bucket policy blocking access
+# "NoSuchKey"          → specific object was deleted
+# "SlowDown"           → request rate throttled (S3 prefix hot spot)
+```
+
+**If "AccessDenied" — check the bucket policy and IAM role:**
+
+```bash
+# What does the bucket policy say?
+aws s3api get-bucket-policy --bucket prod-backups
+
+# What are my effective permissions?
+aws iam simulate-principal-policy \
+  --policy-source-arn arn:aws:iam::123456789:role/backup-reader \
+  --action-names s3:GetObject \
+  --resource-arns arn:aws:s3:::prod-backups/*
+
+# Common cause: bucket policy was updated to deny all, or IAM role was rotated
+```
+
+**Step 2 — Recover deleted objects using S3 versioning.**
+
+If versioning was enabled and objects were deleted (not the bucket):
+
+```bash
+# List all delete markers for a prefix
+aws s3api list-object-versions \
+  --bucket prod-backups \
+  --prefix db-backups/ \
+  --query 'DeleteMarkers[*].[Key,VersionId]' \
+  --output text
+
+# Remove delete markers to restore the objects
+# (automating for many objects)
+aws s3api list-object-versions \
+  --bucket prod-backups \
+  --prefix db-backups/ \
+  --query 'DeleteMarkers[*].[Key,VersionId]' \
+  --output text | while read key version; do
+    aws s3api delete-object \
+      --bucket prod-backups \
+      --key "$key" \
+      --version-id "$version"
+  done
+# After removing delete markers, objects reappear as current versions
+```
+
+**Step 3 — If the bucket itself was deleted.**
+
+S3 bucket deletion is a two-step process: empty the bucket, then delete it. A deleted bucket can be recreated (if the name is available), but objects are gone unless you have cross-region replication or another backup.
+
+```bash
+# Recreate the bucket (if name still available)
+aws s3 mb s3://prod-backups --region ap-south-1
+
+# Restore from cross-region replication (if configured)
+aws s3 sync s3://prod-backups-replica/ s3://prod-backups/
+```
+
+**Step 4 — Restore from cross-region replication or S3 Glacier.**
+
+If you had cross-region replication configured before the incident:
+
+```bash
+# Replicated bucket in another region — copy back
+aws s3 sync s3://prod-backups-dr-us-east-1/ s3://prod-backups/
+
+# If objects are in Glacier (archived tier), initiate a restore first
+aws s3api restore-object \
+  --bucket prod-backups-dr-us-east-1 \
+  --key db-backups/2024-01-14/prod-postgres.dump.gz \
+  --restore-request Days=7,GlacierJobParameters=\{Tier=Standard\}
+# Standard restore: 3–5 hours. Expedited: 1–5 minutes (higher cost).
+```
+
+**Step 5 — Check CloudTrail to understand what happened.**
+
+```bash
+# Who deleted the bucket or objects?
+aws cloudtrail lookup-events \
+  --lookup-attributes AttributeKey=ResourceName,AttributeValue=prod-backups \
+  --start-time "2024-01-15T00:00:00Z" \
+  --end-time "2024-01-15T23:59:59Z" \
+  | jq '.Events[] | {time: .EventTime, name: .EventName, user: .Username}'
+
+# Look for: DeleteBucket, DeleteObject, PutBucketPolicy (access change)
+```
+
+This identifies whether it was human error, a script, or a malicious actor.
+
+**Prevention — what to add after this incident:**
+
+```hcl
+# 1. S3 versioning — never lose an object to accidental deletion
+resource "aws_s3_bucket_versioning" "backups" {
+  bucket = aws_s3_bucket.backups.id
+  versioning_configuration { status = "Enabled" }
+}
+
+# 2. Object Lock COMPLIANCE mode — cannot be deleted for 30 days (regulatory hold)
+resource "aws_s3_bucket_object_lock_configuration" "backups" {
+  bucket = aws_s3_bucket.backups.id
+  rule {
+    default_retention {
+      mode = "COMPLIANCE"
+      days = 30
+    }
+  }
+}
+
+# 3. Cross-region replication — survive a region-level issue
+resource "aws_s3_bucket_replication_configuration" "backups" {
+  bucket = aws_s3_bucket.backups.id
+  role   = aws_iam_role.replication.arn
+  rule {
+    id     = "replicate-all"
+    status = "Enabled"
+    destination {
+      bucket        = aws_s3_bucket.backups_dr.arn
+      storage_class = "STANDARD_IA"
+    }
+  }
+}
+
+# 4. Block public access — bucket cannot accidentally become public
+resource "aws_s3_bucket_public_access_block" "backups" {
+  bucket                  = aws_s3_bucket.backups.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+```
+
+**Real scenario:** A developer ran `aws s3 rm s3://prod-backups/ --recursive` thinking it was a test bucket — the bucket name was similar to a test bucket used earlier that day. 2,400 backup objects deleted. We had versioning enabled with no Object Lock. Recovery: listed all delete markers, removed them in a bulk loop script. All 2,400 objects restored in 8 minutes. Post-incident: added Object Lock COMPLIANCE mode with 30-day retention and cross-region replication. The next deletion attempt failed with: "Object is WORM protected and cannot be deleted."

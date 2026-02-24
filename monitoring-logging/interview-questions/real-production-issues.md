@@ -306,3 +306,107 @@ kubectl top pod prometheus-0 -n monitoring
 ```
 
 **Real scenario:** Our main engineering dashboard had 28 panels and was taking 45 seconds to load. Query Inspector showed 3 panels were each running histogram_quantile over 30d ranges with no label filters — each query took 12–15 seconds in Prometheus. We added recording rules for the three expensive queries and added `env="prod"` label filters. Dashboard load time dropped to 3 seconds. We also split the dashboard into "Operations" (real-time, 1-hour default range) and "Weekly Review" (7-day default range) so engineers always opened the fast one first.
+
+---
+
+## 4. One user reports errors but everyone else is fine — how do you debug this?
+
+When it's one user and not a global outage, the problem is either specific to that user's account, session, location, or the server they're hitting.
+
+**Step 1: Reproduce the issue.**
+
+```bash
+# Get the user's details:
+# - Username / user ID
+# - Browser and OS
+# - Time of error (with timezone)
+# - Error message (exact text or screenshot)
+# - URL they were accessing
+```
+
+Try to reproduce as that user — log in as them if your system supports impersonation or have them share the exact request.
+
+**Step 2: Check if it's a specific backend instance (sticky sessions / pod routing).**
+
+```bash
+# If using ALB — check if the user is consistently hitting one unhealthy target
+# ALB access logs: filter by client IP or user ID, check target_ip column
+grep "user-ip" /path/to/alb-access-logs | awk '{print $14}'  # target IP column
+
+# In Kubernetes — check per-pod error rate
+kubectl top pods
+kubectl logs pod/myapp-abc123 --tail=100 | grep ERROR
+```
+
+A single bad pod in a pool of 5 means 20% of users hit errors randomly, but one user consistently hitting the bad pod sees 100% errors.
+
+**Step 3: Check for account/data-specific issues.**
+
+```bash
+# Query your database for the user's account state
+SELECT status, flags, created_at FROM users WHERE id = 'user-123';
+
+# Check for:
+# - Suspended/locked account
+# - Missing required fields (null phone_number, etc.)
+# - Corrupted data (invalid JSON in a preferences column)
+# - Permission/role misconfiguration
+```
+
+**Step 4: Check feature flags and A/B test groups.**
+
+```
+Is this user in a beta rollout that's partially broken?
+Is a feature flag enabled for their account or organisation tier?
+```
+
+Filter your error logs by user ID:
+
+```bash
+grep "user_id=user-123" /var/log/myapp/app.log | grep -i "error\|exception"
+```
+
+**Step 5: Check rate limiting and IP blocking.**
+
+```bash
+# Is the user being rate limited?
+# Check your rate limit store (Redis):
+redis-cli GET "rate_limit:user:user-123"
+
+# Is the user's IP blocked by WAF?
+# Check WAF logs in CloudWatch for their IP
+```
+
+**Step 6: Check CDN/cache serving stale error.**
+
+```bash
+# If behind CloudFront — check if an error response is cached
+curl -I https://app.example.com/page
+# X-Cache: Hit from cloudfront → user is getting a cached error page
+# Fix: invalidate the specific path
+aws cloudfront create-invalidation \
+  --distribution-id E1234 \
+  --paths "/page"
+```
+
+---
+
+**Decision tree:**
+
+```
+One user affected
+  ↓
+Can you reproduce? No → gather more info (exact URL, timing, error text)
+  ↓ Yes
+Same error on all pods? No → bad pod, restart/drain that instance
+  ↓ Yes
+Account data issue? → fix in DB or admin console
+  ↓ No
+Feature flag group? → remove from broken experiment
+  ↓ No
+Rate limited? → lift limit
+  ↓ No
+CDN caching error? → create invalidation
+```
+
+**Real scenario:** A user reported they couldn't check out — saw "Internal Server Error" every time. Others were checking out fine. Filtering ALB logs by their IP showed they consistently hit the same pod (`10.0.1.45`). That pod's logs showed `NullPointerException` on a specific product SKU that had a null `weight` field (required for shipping calculation). Other users were either not buying that product or hitting different pods that had cached an older version of the product data. Fix: added null check for `weight`, redeployed. The specific pod had a bug triggered only by this SKU's data.

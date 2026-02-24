@@ -266,3 +266,97 @@ sudo fail2ban-client unban <user-ip>
 
 **Real scenario:** A new engineer couldn't SSH into a server despite having their key in `authorized_keys`. The verbose SSH output showed: `Authentication succeeded... but connection closed`. The server's `/etc/ssh/sshd_config` had `AllowUsers alice bob` — the new engineer's username wasn't in the list. Added their username to AllowUsers, reloaded sshd (`systemctl reload sshd`), and they could connect immediately. The auth log showed the rejection clearly: `User charlie not allowed because not listed in AllowUsers`.
 
+> **Also asked as:** "If your EC2 instance is not reachable via SSH, what troubleshooting steps would you perform?" — covered above (network reachability → Security Group port 22 → key authentication → sshd_config → auth.log).
+
+---
+
+## 4. Which logs would you check if a user can't access your application?
+
+Work from the outside in — start where the user's request first enters your system and follow it inward until you find the failure.
+
+**Layer 1: DNS — does the domain resolve?**
+
+```bash
+# From your machine or the user's location:
+dig app.example.com
+nslookup app.example.com
+
+# Check: does it return the expected IP? Is there a CNAME chain that's broken?
+```
+
+**Layer 2: Load balancer logs — ALB access logs.**
+
+ALB logs every request: status code, response time, target IP, error reason.
+
+```
+# In AWS: S3 bucket configured as ALB access log target
+# Log entry format:
+https 2024-01-15T10:23:45 app/my-alb/abc123 1.2.3.4:51234 10.0.1.45:8080 0.001 0.003 0.000 200 200 456 1234 "GET https://app.example.com/login HTTP/1.1" ...
+
+# 502 = target returned error or connection refused
+# 503 = no healthy targets in target group
+# 504 = target timed out (60s default)
+```
+
+**Layer 3: Application logs — what did your app see?**
+
+```bash
+# Nginx / Apache — access and error logs:
+tail -f /var/log/nginx/access.log
+tail -f /var/log/nginx/error.log
+
+# Application-level (varies by stack):
+journalctl -u myapp -f           # systemd service
+docker logs myapp --tail 100     # Docker container
+kubectl logs deploy/myapp        # Kubernetes pod
+
+# Look for: 4xx (client error), 5xx (server error), stack traces, OOM messages
+```
+
+**Layer 4: System logs — is the server itself healthy?**
+
+```bash
+# Disk full? (common cause of 500 errors)
+df -h
+
+# OOM killer killed the app?
+dmesg | grep -i "killed process\|oom"
+journalctl -k | grep -i oom
+
+# System errors:
+/var/log/syslog          # General system messages (Debian/Ubuntu)
+/var/log/messages        # General system messages (RHEL/CentOS)
+/var/log/auth.log        # Authentication failures (if login-gated)
+```
+
+**Layer 5: AWS-specific — Security Groups, NACLs, VPC flow logs.**
+
+```bash
+# VPC flow logs show accepted/rejected traffic at the subnet level
+# Check in CloudWatch Logs if flow logs are enabled:
+# REJECT entries mean NACL or SG is blocking
+
+# Also check: WAF logs if WAF is attached to the ALB
+# WAF can block specific IPs, user agents, or geo-locations
+```
+
+---
+
+**Decision tree:**
+
+```
+User can't access the app
+  ↓
+DNS resolves? No → Fix DNS record
+  ↓ Yes
+ALB returning error? Yes → Check target group health, ALB error logs
+  ↓ No error at ALB
+App log showing errors? Yes → Check stack trace, fix application bug
+  ↓ No app errors
+System healthy? df -h, dmesg → disk full, OOM → fix
+  ↓
+VPC flow logs showing REJECT? → Security Group / NACL blocking the user's IP
+```
+
+**Real scenario:** A user reported they couldn't access the app but others could. ALB logs showed their requests were reaching the load balancer and returning 200 — but the user saw a 403. Root cause: WAF had a geo-blocking rule. The user was connecting via a VPN that exit-nodded through a blocked country. Disabling WAF geo-blocking for their IP unblocked them in minutes.
+

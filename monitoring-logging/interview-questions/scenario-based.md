@@ -509,3 +509,88 @@ No compatibility testing between auth and downstream consumers.
 - Postmortems happen for every Sev-1 and most Sev-2s
 - Action items are tracked and closed — not just written
 - MTTR trends downward quarter over quarter because the system is improving, not just getting patched
+
+---
+
+## 8. What is your approach to monitoring and alerting in production systems?
+
+The goal isn't maximum coverage — it's the right signals, routed to the right people, with actionable runbooks.
+
+**Step 1: Start with the Four Golden Signals.**
+
+Google SRE defines four signals that cover any service:
+
+| Signal | What it measures | Tool |
+|---|---|---|
+| **Latency** | How long requests take (p50, p95, p99) | Prometheus histogram |
+| **Traffic** | Request rate (req/sec) | Prometheus counter |
+| **Errors** | Error rate (5xx / total) | Prometheus counter |
+| **Saturation** | How full the system is (CPU, memory, queue depth) | Node Exporter, app metrics |
+
+Start here before adding anything else. These four signals surface 90% of user-impacting problems.
+
+**Step 2: Alert on symptoms, not causes.**
+
+```yaml
+# BAD — alert on cause (CPU) — doesn't mean users are impacted
+alert: HighCPU
+expr: cpu_usage > 80
+
+# GOOD — alert on symptom (error rate) — users are definitely impacted
+alert: HighErrorRate
+expr: rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.01
+```
+
+High CPU alone isn't an incident. 1% error rate is always an incident.
+
+**Step 3: Layer dashboards by audience.**
+
+```
+Executive dashboard  → SLO compliance, availability, incident count (weekly)
+On-call dashboard    → Four golden signals, active alerts, error rate by service (real-time)
+Debug dashboard      → Per-pod metrics, trace waterfall, log stream (during incidents)
+```
+
+**Step 4: Use burn rate alerts for SLOs (avoid alert fatigue).**
+
+Rather than alerting on raw error rate, alert on how fast you're burning through your error budget:
+
+```yaml
+# 1-hour burn rate > 14x = you'll exhaust 30-day budget in 2 hours → page immediately
+alert: SLOBurnRateFast
+expr: |
+  sum(rate(http_requests_total{status=~"5.."}[1h])) /
+  sum(rate(http_requests_total[1h])) > 14 * 0.001
+
+# 6-hour burn rate > 5x = slower burn but still critical → page with lower urgency
+alert: SLOBurnRateSlow
+expr: |
+  sum(rate(http_requests_total{status=~"5.."}[6h])) /
+  sum(rate(http_requests_total[6h])) > 5 * 0.001
+```
+
+**Step 5: Every alert has a runbook.**
+
+An alert without a runbook is noise. Every Alertmanager rule links to a runbook:
+
+```yaml
+annotations:
+  summary: "High error rate on {{ $labels.service }}"
+  runbook_url: "https://wiki.internal/runbooks/high-error-rate"
+  description: "Error rate is {{ $value | humanizePercentage }} over the last 5 minutes"
+```
+
+**Step 6: Route alerts by severity.**
+
+```yaml
+# Alertmanager routing
+routes:
+  - match: { severity: critical }
+    receiver: pagerduty-oncall     # Page the on-call engineer immediately
+  - match: { severity: warning }
+    receiver: slack-alerts         # Post to Slack, no page
+  - match: { severity: info }
+    receiver: slack-info           # Informational, low-urgency channel
+```
+
+**Our stack:** Prometheus (metrics) + Alertmanager (routing) + Grafana (dashboards) + PagerDuty (on-call rotation) + Loki (logs) + Tempo (traces).

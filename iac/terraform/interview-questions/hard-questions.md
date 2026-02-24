@@ -512,3 +512,148 @@ resource "aws_db_instance" "main" {
 Prod calls with `enable_multi_az = true`. Dev calls with default `false`. Same module, behavior controlled by variables.
 
 **Real scenario:** A team had `dev/main.tf`, `staging/main.tf`, `prod/main.tf` — three 400-line files. When we audited them, prod had 12 security fixes that never got to dev (dev was running with old insecure defaults). We refactored to the module pattern in a day. Now a security fix to the `rds` module applies to dev, staging, and prod in sequence automatically. Dev and staging are guaranteed to test the exact configuration that hits prod.
+
+---
+
+## 5. You want faster Terraform runs in large projects — what optimisations would you apply?
+
+Slow Terraform plans and applies are a productivity killer. A 15-minute plan for every PR means engineers stop running plan locally and miss issues. Here are the concrete optimisations, ordered from easiest to most impactful.
+
+**Problem 1: `terraform plan` refreshes every resource on every run.**
+
+By default, Terraform calls the AWS API to verify the state of every resource before computing the plan. With 300 resources, that's 300+ API calls — slow and subject to throttling.
+
+**Fix: Use `-refresh=false` when you know state is current.**
+
+```bash
+# For PR review plans — skip the refresh (state is fresh from last CI apply)
+terraform plan -refresh=false
+
+# When you DO want to catch drift:
+terraform plan -refresh-only   # Separate drift detection run
+```
+
+In CI, the state is just-applied and current. Refreshing 300 resources for every PR plan adds 5–10 minutes with no benefit. We run `-refresh=false` for PR plans and full refresh for the nightly drift detection job.
+
+**Problem 2: Single large state file — plan scans everything.**
+
+```
+Before: One state file, 300 resources, 18-minute plan
+After:  6 state files, 50 resources each, 3-minute plan per stack
+```
+
+Splitting state by domain (networking, EKS, RDS, services) means a change to the `order-service` stack only plans 40 resources, not 300. Covered in detail in real-production Q3.
+
+**Problem 3: Default parallelism is too conservative (or too aggressive).**
+
+Terraform creates/destroys resources in parallel up to a default of 10 concurrent operations. Too low = slow. Too high = AWS API throttling.
+
+```bash
+# Increase parallelism for faster applies (if not hitting API throttling)
+terraform apply -parallelism=20
+
+# Decrease if you see ThrottlingException errors from AWS
+terraform apply -parallelism=5
+```
+
+For large environments with diverse resource types (IAM, EC2, EKS), higher parallelism works well because different AWS services have independent rate limits. For environments heavy on a single service (many EC2 instances), lower parallelism avoids throttling.
+
+**Problem 4: Module downloads on every `terraform init`.**
+
+```bash
+# Default init downloads all modules from the registry every time
+terraform init   # Downloads modules from Terraform Registry
+
+# Cache the module downloads in CI
+- uses: actions/cache@v4
+  with:
+    path: |
+      .terraform/modules
+      .terraform/providers
+    key: terraform-${{ hashFiles('.terraform.lock.hcl') }}
+    restore-keys: terraform-
+```
+
+Module and provider downloads can add 2–5 minutes to `terraform init`. Cache them keyed on the lock file — they only re-download when `required_providers` or module versions change.
+
+**Problem 5: Provider initialisation is slow at scale.**
+
+If you use many providers (AWS, Kubernetes, Helm, Datadog, PagerDuty), init downloads all of them. Each provider binary is 50–300MB.
+
+```bash
+# Check what you're downloading
+cat .terraform.lock.hcl | grep "provider\|version"
+
+# Split providers across stacks — an EKS stack doesn't need the PagerDuty provider
+# networking stack: aws provider only
+# eks stack: aws + kubernetes + helm providers
+# monitoring stack: aws + datadog + pagerduty providers
+```
+
+Using the CI cache (above) eliminates repeated downloads after the first run.
+
+**Problem 6: `for_each` and `count` with large sets.**
+
+```hcl
+# Slow: for_each over 50 IAM users
+resource "aws_iam_user" "devs" {
+  for_each = toset(var.developers)  # 50 users → 50 separate AWS API calls
+}
+```
+
+Each element in `for_each` generates a separate resource in state and a separate API call during plan. For large sets, this is inherently slow.
+
+**Fix: Use AWS-native bulk resources where available.**
+
+```hcl
+# Instead of 50 individual users, use a group with a membership list
+resource "aws_iam_group" "developers" {
+  name = "developers"
+}
+
+resource "aws_iam_group_membership" "developers" {
+  name  = "developers-membership"
+  group = aws_iam_group.developers.name
+  users = var.developers  # One API call, not 50
+}
+```
+
+**Problem 7: Using `terraform show` on a large state.**
+
+```bash
+# Slow: terraform show renders all 300 resources as HCL
+terraform show
+
+# Fast: query only what you need
+terraform state show aws_eks_cluster.main    # Single resource
+terraform output                             # Just outputs
+terraform state list | grep order_service   # Find specific resources
+```
+
+**Problem 8: Provider version constraints too broad.**
+
+```hcl
+# Bad: allows Terraform to search for the latest matching version on every init
+provider "aws" {
+  version = ">= 5.0"
+}
+
+# Good: pin to an exact or narrow range — init resolves instantly from lock file
+provider "aws" {
+  version = "~> 5.31"
+}
+```
+
+Broad version constraints cause the Terraform registry to be queried for the latest matching version. Pinned versions resolve from `.terraform.lock.hcl` with no network call.
+
+**Summary — fastest wins in order:**
+
+| Optimisation | Effort | Typical time saved |
+|---|---|---|
+| `-refresh=false` for PR plans | Zero — just add a flag | 3–8 min per plan |
+| CI cache for modules/providers | Low — add cache step | 2–5 min per init |
+| Split state by domain | High — refactoring | 10–15 min per plan |
+| Tune parallelism | Zero | 1–3 min per apply |
+| Pin provider versions | Low | 30s–2 min per init |
+
+**Real scenario:** Our CI plan was taking 22 minutes. Root causes: single state file with 280 resources (18 min for full refresh), no CI cache for providers (3 min for init), default parallelism. After: split to 5 stacks (each plans in 3–4 min), added provider cache (init: 20 sec), `-refresh=false` for PR plans (nightly drift job does the real refresh). Result: PR plan now runs in 4 minutes. Engineers run `terraform plan` locally before every commit — they were skipping it before because 22 minutes was too slow.

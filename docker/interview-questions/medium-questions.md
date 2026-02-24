@@ -514,3 +514,153 @@ Build-time Trivy runs against the CVE database at the moment of the build. An im
 | ECR Enhanced Scanning | Registry (post-push + continuous) | OS packages, new CVEs on existing images |
 | Snyk (optional) | CI or IDE | Language dependencies (deep SBOM analysis) |
 | Checkov | CI pipeline | Dockerfile misconfigurations, IaC |
+
+---
+
+## 7. How do you manage multi-container dependencies using Docker Compose?
+
+Docker Compose lets you define multi-container apps in a single `docker-compose.yml`. Managing dependencies means controlling startup order and health-based readiness.
+
+**Basic dependency: `depends_on`.**
+
+```yaml
+version: "3.9"
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    depends_on:
+      - db
+      - redis
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: secret
+
+  redis:
+    image: redis:7-alpine
+```
+
+`depends_on` only waits for the container to start — not for the service inside to be ready. Postgres takes 2–3 seconds to accept connections after starting.
+
+**Production-ready: `depends_on` with `condition: service_healthy`.**
+
+```yaml
+services:
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: secret
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s     # Give Postgres time to start before first check
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+```
+
+With `condition: service_healthy`, the `app` container only starts after both `db` and `redis` pass their health checks. No more "connection refused on startup" errors.
+
+**Useful Compose commands:**
+
+```bash
+docker compose up -d              # Start all services in background
+docker compose up --build         # Rebuild images before starting
+docker compose ps                 # Show service status + health
+docker compose logs -f app        # Follow logs for one service
+docker compose restart app        # Restart a single service
+docker compose down -v            # Stop + remove containers and volumes
+```
+
+---
+
+## 8. How do you monitor container performance in production?
+
+Container monitoring has three layers: host-level metrics, container-level metrics, and application-level metrics.
+
+**Layer 1: Container-level metrics — Docker stats.**
+
+```bash
+# Real-time resource usage for all containers:
+docker stats
+
+# CONTAINER ID   NAME     CPU %   MEM USAGE / LIMIT   MEM %   NET I/O   BLOCK I/O
+# a1b2c3d4e5f6   myapp    12.5%   256MiB / 512MiB     50%     1.2MB/s   45kB/s
+```
+
+**Layer 2: cAdvisor — container metrics for Prometheus.**
+
+cAdvisor runs as a container on each host and exposes Docker metrics for Prometheus to scrape:
+
+```yaml
+# docker-compose.yml
+cadvisor:
+  image: gcr.io/cadvisor/cadvisor:latest
+  ports:
+    - "8080:8080"
+  volumes:
+    - /:/rootfs:ro
+    - /var/run:/var/run:ro
+    - /sys:/sys:ro
+    - /var/lib/docker/:/var/lib/docker:ro
+```
+
+Key metrics exposed:
+- `container_cpu_usage_seconds_total` — CPU usage per container
+- `container_memory_usage_bytes` — memory usage
+- `container_network_receive_bytes_total` — network in
+- `container_fs_writes_bytes_total` — disk I/O
+
+**Layer 3: Prometheus + Grafana dashboard.**
+
+```yaml
+# Prometheus scrape config for cAdvisor
+scrape_configs:
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['cadvisor:8080']
+```
+
+Grafana dashboard shows: per-container CPU/memory trend, OOM events, restart count, network throughput.
+
+**Layer 4: Log aggregation.**
+
+```bash
+# Forward Docker logs to a central system:
+docker run --log-driver=awslogs \
+  --log-opt awslogs-group=/prod/myapp \
+  --log-opt awslogs-region=ap-south-1 \
+  myapp:1.0
+
+# Or use Fluentd/Fluent Bit as a sidecar or log driver
+```
+
+**Key alerts to set up:**
+
+```yaml
+# Container memory near limit → risk of OOMKill
+alert: ContainerMemoryHigh
+expr: container_memory_usage_bytes / container_spec_memory_limit_bytes > 0.85
+
+# Container restarting frequently
+alert: ContainerRestartLoop
+expr: rate(kube_pod_container_status_restarts_total[15m]) > 0
+```

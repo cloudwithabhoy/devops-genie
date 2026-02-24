@@ -325,3 +325,322 @@ locals {
 ```
 
 **Real scenario:** Our team started with separate directories per environment (dev/, staging/, prod/) and managed all three manually. After 6 months, the directories had drifted — staging had resources dev didn't, prod had a different VPC CIDR than staging. We migrated to a workspace-based approach: one set of .tf files with `local.env` lookups for all size/configuration differences. The benefit: a change to the EKS node group configuration is applied to dev first, then staging, then prod — same code guaranteed. The risk we mitigated: we added a CI/CD policy that only allows `terraform apply` to prod through a pull request + manual approval step. No direct CLI applies to the prod workspace without PR review.
+
+---
+
+## 3. How would you provision infrastructure across 10 AWS regions simultaneously?
+
+Provisioning the same infrastructure in 10 regions requires provider aliasing or a loop-based approach. The right choice depends on whether regions are truly identical or have region-specific config.
+
+**Approach 1: Provider aliases (small number of regions).**
+
+```hcl
+# providers.tf
+provider "aws" {
+  alias  = "us_east_1"
+  region = "us-east-1"
+}
+
+provider "aws" {
+  alias  = "eu_west_1"
+  region = "eu-west-1"
+}
+
+# main.tf — explicitly reference each alias
+module "vpc_us" {
+  source    = "./modules/vpc"
+  providers = { aws = aws.us_east_1 }
+  cidr      = "10.0.0.0/16"
+}
+
+module "vpc_eu" {
+  source    = "./modules/vpc"
+  providers = { aws = aws.eu_west_1 }
+  cidr      = "10.1.0.0/16"
+}
+```
+
+This works but becomes repetitive across 10 regions.
+
+**Approach 2: `for_each` with dynamic providers (Terraform 1.6+).**
+
+```hcl
+# variables.tf
+variable "regions" {
+  default = [
+    "us-east-1", "us-west-2", "eu-west-1", "eu-central-1",
+    "ap-southeast-1", "ap-south-1", "ap-northeast-1",
+    "ca-central-1", "sa-east-1", "af-south-1"
+  ]
+}
+
+# Use a wrapper module per region (still needs alias per provider in older Terraform)
+# With Terraform 1.6+ provider iteration:
+provider "aws" {
+  for_each = toset(var.regions)
+  alias    = each.key
+  region   = each.key
+}
+```
+
+**Approach 3: Separate Terraform workspaces + CI matrix (most practical for 10 regions).**
+
+```yaml
+# GitHub Actions matrix — runs terraform apply in parallel for each region
+strategy:
+  matrix:
+    region: [us-east-1, us-west-2, eu-west-1, eu-central-1, ap-southeast-1,
+             ap-south-1, ap-northeast-1, ca-central-1, sa-east-1, af-south-1]
+
+steps:
+  - name: Terraform Apply
+    run: |
+      terraform init -backend-config="region=${{ matrix.region }}"
+      terraform workspace select ${{ matrix.region }} || terraform workspace new ${{ matrix.region }}
+      terraform apply -auto-approve -var="region=${{ matrix.region }}"
+    env:
+      AWS_DEFAULT_REGION: ${{ matrix.region }}
+```
+
+Each region runs in parallel — 10 `terraform apply` jobs run simultaneously across matrix jobs, completing in the time it takes for one apply.
+
+**State management for multi-region:**
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket = "my-terraform-state"
+    key    = "regions/${var.region}/terraform.tfstate"
+    region = "us-east-1"   # State bucket is centralised in one region
+    dynamodb_table = "terraform-locks"
+  }
+}
+```
+
+Each region gets its own state file path. The DynamoDB lock table is centralised.
+
+**Real scenario:** We had to deploy a WAF + CloudFront + Route 53 health check stack to 6 regions for latency-based routing. We used the CI matrix approach — all 6 regions applied in parallel, total time 4 minutes instead of 24 minutes sequential.
+
+---
+
+## 4. How do you run Terraform safely in CI/CD pipelines?
+
+Running Terraform in CI/CD means automation executes infrastructure changes — no human reviewing each apply. Safety means: no accidental destroys, plan always reviewed before apply, prod requires approval, and secrets are never in CI logs.
+
+**The core pattern: plan on PR, apply on merge, require approval for prod.**
+
+```
+PR opened    → terraform plan (read-only, fails fast on errors)
+PR merged    → terraform apply to dev/staging (automatic)
+Prod release → terraform plan + manual approval → terraform apply to prod
+```
+
+**Step 1 — Use OIDC for credential-free authentication (GitHub Actions + AWS).**
+
+Never store AWS access keys in CI secrets. Use OIDC federation — GitHub Actions gets a temporary AWS role via trust policy:
+
+```hcl
+# Terraform — create the trust relationship
+resource "aws_iam_role" "github_actions_terraform" {
+  name = "github-actions-terraform"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Federated = aws_iam_openid_connect_provider.github.arn }
+      Action    = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+        }
+        StringLike = {
+          # Only allow runs from your specific repo and main branch
+          "token.actions.githubusercontent.com:sub" = "repo:myorg/myrepo:ref:refs/heads/main"
+        }
+      }
+    }]
+  })
+}
+```
+
+```yaml
+# GitHub Actions — no static credentials needed
+- uses: aws-actions/configure-aws-credentials@v4
+  with:
+    role-to-assume: arn:aws:iam::123456789:role/github-actions-terraform
+    aws-region: ap-south-1
+    # Token expires after 1 hour — no long-lived credentials
+```
+
+**Step 2 — Plan on every PR, save the plan as an artifact.**
+
+```yaml
+# .github/workflows/terraform.yml
+jobs:
+  terraform-plan:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write     # Required for OIDC
+      contents: read
+      pull-requests: write  # To post plan as PR comment
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ap-south-1
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: Terraform Init
+        run: terraform init
+        working-directory: environments/staging
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -no-color -out=tfplan
+        working-directory: environments/staging
+
+      - name: Save plan as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.sha }}
+          path: environments/staging/tfplan
+          retention-days: 5
+
+      - name: Post plan to PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = `\`\`\`\n${{ steps.plan.outputs.stdout }}\n\`\`\``;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+```
+
+The plan is posted as a PR comment — reviewers see exactly what infrastructure will change before approving the merge. The saved `tfplan` artifact ensures the apply uses the exact plan that was reviewed (not a new plan that could differ).
+
+**Step 3 — Apply using the saved plan (not a new plan).**
+
+```yaml
+  terraform-apply:
+    needs: terraform-plan
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ap-south-1
+
+      - name: Download saved plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ github.sha }}
+          path: environments/staging
+
+      - name: Terraform Init
+        run: terraform init
+        working-directory: environments/staging
+
+      - name: Terraform Apply saved plan
+        run: terraform apply -auto-approve tfplan
+        working-directory: environments/staging
+```
+
+Using the saved `tfplan` guarantees the apply executes exactly what was planned and reviewed — no race conditions where infrastructure changed between plan and apply.
+
+**Step 4 — Require manual approval for production.**
+
+```yaml
+  terraform-apply-prod:
+    needs: terraform-plan-prod
+    runs-on: ubuntu-latest
+    environment: production    # GitHub environment with protection rules
+    # In GitHub: Settings → Environments → production → Required reviewers: [lead-devops]
+    # Apply only runs after a reviewer approves in the GitHub UI
+
+    steps:
+      - name: Terraform Apply to Production
+        run: terraform apply -auto-approve tfplan
+        working-directory: environments/prod
+```
+
+The `environment: production` setting creates a pause — the apply job waits until a designated reviewer approves in the GitHub UI. The plan output is visible to the reviewer from the PR comment before they approve.
+
+**Step 5 — Block applies that contain resource destruction.**
+
+```yaml
+      - name: Check for resource destruction
+        run: |
+          PLAN_JSON=$(terraform show -json tfplan)
+          DESTROYS=$(echo "$PLAN_JSON" | jq '[.resource_changes[] | select(.change.actions | contains(["delete"]))] | length')
+          if [ "$DESTROYS" -gt "0" ]; then
+            echo "::error::Plan contains $DESTROYS resource destructions. Manual review required."
+            echo "Resources to be destroyed:"
+            echo "$PLAN_JSON" | jq -r '.resource_changes[] | select(.change.actions | contains(["delete"])) | .address'
+            exit 1
+          fi
+```
+
+Any plan containing a `destroy` fails the CI check. An engineer must explicitly approve the destruction in a separate step — it can never happen automatically.
+
+**Step 6 — Lock the state during applies (prevent concurrent runs).**
+
+The S3 backend + DynamoDB locking prevents two CI jobs from applying simultaneously:
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket         = "my-terraform-state"
+    key            = "prod/main/terraform.tfstate"
+    region         = "ap-south-1"
+    dynamodb_table = "terraform-lock-prod"   # DynamoDB table for state locking
+    encrypt        = true
+  }
+}
+```
+
+If a CI job has the lock, a concurrent job waits or fails with:
+```
+Error: Error acquiring the state lock
+```
+
+Combine with GitHub Actions `concurrency` to prevent queued runs from piling up:
+
+```yaml
+concurrency:
+  group: terraform-prod
+  cancel-in-progress: false   # Don't cancel — let running apply finish
+```
+
+**Step 7 — Pin the Terraform version in CI.**
+
+```yaml
+- uses: hashicorp/setup-terraform@v3
+  with:
+    terraform_version: "1.7.0"   # Exact version — no surprises from upgrades
+```
+
+Also pin it in `versions.tf`:
+
+```hcl
+terraform {
+  required_version = "= 1.7.0"   # Fails if a different version is used
+}
+```
+
+If the CI and local versions differ, plans will differ — causing confusion about what "the plan" actually shows.
+
+**Real scenario:** We had a CI pipeline that ran `terraform apply -auto-approve` directly on every merge to main — no plan review, no approval gate for prod. A developer refactored a variable name, which caused an unexpected resource replacement of an RDS instance (identifier change). The apply ran automatically and destroyed the prod database before anyone saw the plan. After rebuilding from backup (4-hour outage), we implemented: plan-as-PR-comment, saved plan artifact, destruction check (`exit 1` on any `-`), and GitHub environment approval for prod. In the next 12 months, two potential accidental destroys were caught by the destruction check. Zero unplanned infrastructure changes reached production.

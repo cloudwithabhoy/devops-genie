@@ -452,3 +452,330 @@ Route 53 supports most TLDs (`.com`, `.in`, `.io`, `.dev`, etc.). Pricing varies
 - **Latency-based** — route users to the closest AWS region
 - **Failover** — primary + secondary, switch automatically on health check failure
 - **Geolocation** — route Indian users to `ap-south-1`, US users to `us-east-1`
+
+---
+
+## 7. What is NACL in AWS, and what is the difference between a Security Group and a NACL?
+
+**NACL (Network Access Control List)** is a stateless firewall that operates at the **subnet level** in a VPC. It controls traffic entering and leaving a subnet by evaluating rules in numbered order (lowest number first).
+
+**Security Group** is a stateful firewall that operates at the **instance (ENI) level**. It controls traffic to and from individual EC2 instances, Lambda functions, RDS instances, etc.
+
+**Key differences:**
+
+| | Security Group | NACL |
+|---|---|---|
+| Level | Instance (ENI) | Subnet |
+| State | **Stateful** — return traffic allowed automatically | **Stateless** — must explicitly allow inbound AND outbound |
+| Rules | Allow rules only | Allow AND Deny rules |
+| Rule evaluation | All rules evaluated together | Rules evaluated in order (lowest number wins) |
+| Default | Deny all inbound, allow all outbound | Allow all inbound and outbound |
+| Scope | Applies to specific instances | Applies to all instances in the subnet |
+
+**Stateful vs Stateless — the most important difference:**
+
+```
+Security Group (stateful):
+  → Allow inbound port 443
+  ← Return traffic (response) automatically allowed — no outbound rule needed
+
+NACL (stateless):
+  → Must explicitly allow inbound port 443
+  ← Must also explicitly allow outbound ephemeral ports (1024-65535) for the response
+     otherwise the response is blocked even though the request was allowed
+```
+
+**When to use each:**
+
+- **Security Groups** — primary line of defence for every resource. Always configured.
+- **NACLs** — additional layer for subnet-wide blocking. Common use: block a specific IP range or CIDR that is attacking your infrastructure across all instances in the subnet. You can't do an explicit Deny in a Security Group — you need a NACL for that.
+
+```hcl
+# NACL rule to block a specific IP (not possible with Security Groups)
+resource "aws_network_acl_rule" "block_attacker" {
+  network_acl_id = aws_network_acl.main.id
+  rule_number    = 50          # Lower number = higher priority
+  egress         = false
+  protocol       = "-1"        # All traffic
+  rule_action    = "deny"
+  cidr_block     = "185.220.101.0/24"   # Attacker IP range
+}
+```
+
+> **Also asked as:** "What's the difference between Security Groups and NACLs?" — covered above (SG = stateful, instance-level; NACL = stateless, subnet-level with explicit deny rules).
+
+---
+
+## 8. What is an EC2 instance store, and how is it different from an EBS volume?
+
+**EC2 Instance Store** is temporary block storage physically attached to the host server running your EC2 instance. It's included with certain instance types (no extra cost) and provides very high I/O performance — but all data is lost when the instance stops, terminates, or the underlying hardware fails.
+
+**EBS (Elastic Block Store)** is a persistent network-attached block storage volume. Data survives instance stops, terminations, and hardware failures. It exists independently of the instance.
+
+**Key differences:**
+
+| | Instance Store | EBS Volume |
+|---|---|---|
+| Persistence | **Ephemeral** — data lost on stop/terminate | **Persistent** — data survives independently |
+| Performance | Extremely high (NVMe, locally attached) | High (up to 64,000 IOPS on io2) |
+| Cost | Included with instance price | Charged per GB per month |
+| Snapshots | Not supported | Snapshots to S3 supported |
+| Resize | Cannot resize | Can resize without downtime |
+| Reattach | Cannot detach/reattach | Can detach and attach to another instance |
+| Use case | Temp files, caches, buffers, scratch space | OS disk, databases, any persistent data |
+
+**When to use instance store:**
+
+- High-performance temporary storage (ML training scratch space, video encoding intermediate files, Kafka/Elasticsearch data nodes where data is replicated across the cluster — losing one node's data is acceptable)
+- Caching layers (Redis, Memcached) where the cache is cold-startable
+- Instance types optimised for storage: `i3`, `i4i`, `d3` — designed for high IOPS workloads
+
+**Never store on instance store:**
+- Database files (RDS uses EBS for this reason)
+- Application data that must survive a reboot
+- Anything without a replica elsewhere
+
+---
+
+## 9. How many types of storage classes are there in S3, and what are they used for?
+
+S3 has **7 storage classes**, each with different cost, availability, and retrieval characteristics:
+
+| Storage Class | Use Case | Availability | Retrieval |
+|---|---|---|---|
+| **S3 Standard** | Frequently accessed data | 99.99% | Milliseconds |
+| **S3 Intelligent-Tiering** | Unknown or changing access patterns | 99.9% | Milliseconds |
+| **S3 Standard-IA** (Infrequent Access) | Accessed < once/month, must be fast | 99.9% | Milliseconds |
+| **S3 One Zone-IA** | Infrequent access, single AZ only | 99.5% | Milliseconds |
+| **S3 Glacier Instant Retrieval** | Archives accessed once/quarter | 99.9% | Milliseconds |
+| **S3 Glacier Flexible Retrieval** | Archives, retrieval in minutes-hours | 99.99% | 1 min – 12 hrs |
+| **S3 Glacier Deep Archive** | Long-term archives (7-10 years) | 99.99% | 12 – 48 hrs |
+
+**Cost order (cheapest to most expensive per GB stored):**
+Deep Archive → Glacier Flexible → Glacier Instant → One Zone-IA → Standard-IA → Intelligent-Tiering → Standard
+
+**Practical usage:**
+
+```hcl
+resource "aws_s3_bucket_lifecycle_configuration" "logs" {
+  bucket = aws_s3_bucket.logs.id
+
+  rule {
+    id     = "log-archival"
+    status = "Enabled"
+
+    transition {
+      days          = 30
+      storage_class = "STANDARD_IA"    # After 30 days → cheaper infrequent-access
+    }
+    transition {
+      days          = 90
+      storage_class = "GLACIER_IR"     # After 90 days → archive
+    }
+    expiration {
+      days = 365                        # Delete after 1 year
+    }
+  }
+}
+```
+
+**Intelligent-Tiering** is the "set and forget" option — S3 automatically moves objects between frequent and infrequent access tiers based on actual access patterns. No retrieval fees, small monitoring fee per object. Best for data where access patterns are unpredictable.
+
+---
+
+## 10. What is the use of the m5.2xlarge instance type?
+
+The instance type name follows a pattern: **family** + **generation** + **size**.
+
+```
+m  5  .  2xlarge
+│  │       └── Size: 2xlarge = 8 vCPU, 32 GB RAM
+│  └────────── Generation: 5th gen (Intel Xeon Platinum)
+└───────────── Family: m = general purpose (balanced compute + memory)
+```
+
+**m5.2xlarge specs:**
+- 8 vCPU
+- 32 GB RAM
+- Up to 10 Gbps network bandwidth
+- EBS-optimized by default
+
+**Use case:** General-purpose workloads that need a balance of compute and memory — web servers, application servers, small databases, dev/test environments, microservices. The `m` family is the default choice when you don't have a specific performance requirement skewing toward CPU or memory.
+
+**EC2 instance family overview:**
+
+| Family | Optimised for | Examples | Use case |
+|---|---|---|---|
+| `m` | General purpose (balanced) | m5, m6i, m7i | Web servers, app servers |
+| `c` | Compute optimised (high CPU) | c5, c6i, c7i | CPU-intensive apps, batch processing |
+| `r` | Memory optimised (high RAM) | r5, r6i, r7i | In-memory databases, Redis, SAP HANA |
+| `i` | Storage optimised (NVMe) | i3, i4i | High IOPS databases, data warehouses |
+| `p` / `g` | GPU | p4, g5 | ML training, video rendering |
+| `t` | Burstable (CPU credits) | t3, t3a | Low-traffic dev/test, small websites |
+
+**EC2 instance types count:** AWS has **700+ instance types** across all families and generations. In practice, most workloads use a small subset: `t3` (dev), `m5/m6i` (general), `c5/c6i` (compute), `r5/r6i` (memory), `i3/i4i` (storage).
+
+---
+
+## 11. What is CloudFront and how does it work as a CDN in AWS?
+
+**CloudFront** is AWS's CDN (Content Delivery Network). It caches content at **edge locations** (Points of Presence) distributed globally — currently 400+ edge locations across 90+ cities. When a user requests content, CloudFront serves it from the nearest edge location instead of the origin server, reducing latency dramatically.
+
+**How it works:**
+
+```
+User in Mumbai requests https://cdn.myapp.com/logo.png
+    ↓
+CloudFront edge location in Mumbai
+    ↓ (cache hit) → serves from cache in <10ms
+    ↓ (cache miss) → fetches from origin (S3/ALB/EC2), caches it, then serves
+
+Next user in Mumbai requests the same file
+    ↓
+Served from Mumbai edge cache — origin is never hit again
+```
+
+**Origins CloudFront can sit in front of:**
+- S3 buckets (static websites, media files)
+- ALB (dynamic application content)
+- EC2 instances
+- Any HTTP server (on-premises, other cloud)
+
+```hcl
+resource "aws_cloudfront_distribution" "cdn" {
+  origin {
+    domain_name = aws_s3_bucket.assets.bucket_regional_domain_name
+    origin_id   = "S3-assets"
+
+    s3_origin_config {
+      origin_access_identity = aws_cloudfront_origin_access_identity.oai.cloudfront_access_identity_path
+    }
+  }
+
+  enabled             = true
+  default_root_object = "index.html"
+
+  default_cache_behavior {
+    target_origin_id       = "S3-assets"
+    viewer_protocol_policy = "redirect-to-https"
+    allowed_methods        = ["GET", "HEAD"]
+    cached_methods         = ["GET", "HEAD"]
+
+    forwarded_values {
+      query_string = false
+      cookies { forward = "none" }
+    }
+
+    min_ttl     = 0
+    default_ttl = 86400    # Cache for 1 day
+    max_ttl     = 31536000 # Max 1 year
+  }
+
+  restrictions {
+    geo_restriction { restriction_type = "none" }
+  }
+
+  viewer_certificate {
+    acm_certificate_arn = aws_acm_certificate.cdn.arn
+    ssl_support_method  = "sni-only"
+  }
+}
+```
+
+**Benefits beyond caching:**
+- **DDoS protection** — AWS Shield Standard is included with CloudFront at no extra cost
+- **WAF integration** — attach AWS WAF to block SQL injection, rate limit IPs
+- **HTTPS everywhere** — free SSL certificate via ACM, HTTPS at the edge
+- **Cost** — data transfer from CloudFront to users is cheaper than from EC2/ALB directly
+
+---
+
+## 12. What type of database is DynamoDB — is it relational?
+
+**DynamoDB is not relational.** It is a **NoSQL key-value and document database** — fully managed, serverless, and built for single-digit millisecond latency at any scale.
+
+**Relational databases (SQL):**
+- Data stored in tables with rows and columns
+- Fixed schema — every row has the same columns
+- Relationships between tables (foreign keys, JOINs)
+- ACID transactions
+- Scale vertically (bigger server) or read replicas
+- Examples: PostgreSQL, MySQL, Oracle, SQL Server
+
+**DynamoDB (NoSQL):**
+- Data stored as items (like documents/rows) in tables
+- **Flexible schema** — each item can have different attributes
+- No JOINs — data is denormalized, designed for single-table access patterns
+- Primary key: Partition Key (required) + Sort Key (optional)
+- Scales horizontally automatically — no manual sharding
+- Millisecond latency at any scale (millions of requests/second)
+
+```python
+# DynamoDB item — no fixed schema
+{
+    "user_id": "usr_123",          # Partition key
+    "timestamp": "2024-01-15",     # Sort key
+    "name": "Alice",
+    "email": "alice@example.com",
+    "preferences": {               # Nested document — flexible
+        "theme": "dark",
+        "notifications": True
+    }
+}
+# Another item in the same table can have completely different attributes
+```
+
+**When to use DynamoDB:**
+- High-throughput, low-latency lookups (user sessions, shopping carts, leaderboards)
+- Known access patterns (you design the table around how you query it)
+- Serverless applications (scales to zero, pay per request)
+- Global applications (DynamoDB Global Tables for multi-region active-active)
+
+**When NOT to use DynamoDB:**
+- Complex queries with multiple filters, aggregations, GROUP BY — use RDS/Aurora
+- Existing relational data model with JOINs — use PostgreSQL/MySQL
+- Ad-hoc analytics — use Redshift or Athena
+
+---
+
+## 13. What type of database is PostgreSQL?
+
+**PostgreSQL is a relational database** — specifically an open-source, object-relational database management system (ORDBMS). It uses structured tables, SQL for queries, enforces schema, and supports ACID transactions (Atomicity, Consistency, Isolation, Durability).
+
+**Key characteristics:**
+
+```sql
+-- Tables with defined schema (every row must conform)
+CREATE TABLE orders (
+    order_id    SERIAL PRIMARY KEY,
+    user_id     INTEGER REFERENCES users(id),   -- Foreign key relationship
+    amount      DECIMAL(10,2) NOT NULL,
+    created_at  TIMESTAMP DEFAULT NOW()
+);
+
+-- JOINs across related tables
+SELECT u.name, COUNT(o.order_id) AS total_orders
+FROM users u
+JOIN orders o ON u.id = o.user_id
+WHERE o.created_at > NOW() - INTERVAL '30 days'
+GROUP BY u.name
+ORDER BY total_orders DESC;
+```
+
+**Why PostgreSQL is widely used in production:**
+- **ACID compliant** — financial transactions, order processing, any data where consistency matters
+- **Rich data types** — JSON/JSONB, arrays, hstore, UUID, geospatial (PostGIS)
+- **Extensions** — PostGIS (geospatial), pg_vector (AI embeddings), TimescaleDB (time-series)
+- **Open source** — no licensing cost
+- **AWS RDS / Aurora PostgreSQL** — fully managed in AWS
+
+**PostgreSQL vs DynamoDB — when to choose:**
+
+| Need | Choose |
+|---|---|
+| Complex queries, reporting, analytics | PostgreSQL |
+| Known simple lookups, massive scale | DynamoDB |
+| ACID transactions across multiple tables | PostgreSQL |
+| Flexible schema, JSON documents | Either (Postgres has JSONB) |
+| Serverless, automatic scaling | DynamoDB |
+| Existing relational data model | PostgreSQL |

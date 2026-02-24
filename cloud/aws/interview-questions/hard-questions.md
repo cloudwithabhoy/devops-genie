@@ -102,6 +102,8 @@ RDS Multi-AZ failover time: ~60–120 seconds (automatic, DNS-based). If this is
 
 **Real scenario:** Our first "multi-AZ" deployment was actually single-AZ in disguise — we had 3 EC2 instances all in `ap-south-1a`. The ALB was multi-AZ but all targets were in one AZ. When `ap-south-1a` had a brief outage, the ALB had no healthy targets. 22-minute outage. After that: min 1 instance per AZ enforced by ASG AZ balancing, RDS Multi-AZ enabled, ElastiCache cluster mode. Next AZ issue: 0 downtime.
 
+> **Also asked as:** "Explain how you would design a highly available EC2 architecture across multiple AZs for a web application." — covered above (ALB + ASG across ≥2 AZs, RDS Multi-AZ, ElastiCache Multi-AZ, stateless app tier).
+
 ---
 
 ## 2. How do you implement cross-account access securely in AWS?
@@ -236,6 +238,8 @@ Management Account (billing, Organizations)
 ```
 
 EKS nodes in the prod account can pull images from the shared-services ECR without any credential sharing — IAM role assumption handles it transparently.
+
+> **Also asked as:** "Your organization needs to grant cross-account access to a partner. How would you implement it?" — covered above (IAM role in your account, trust policy allowing partner's account, STS AssumeRole, no credential sharing).
 
 ---
 

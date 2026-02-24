@@ -218,6 +218,8 @@ The best rollback strategy is not needing to roll back. We add gates before prod
 
 Most regressions are caught at step 2 or 3. Rollbacks happen, but rarely.
 
+> **Also asked as:** "How do you handle rollback in case of a failed release?" — covered above (git revert, versioned artifacts, Blue/Green switch-back, feature flags).
+
 ---
 
 ## 2. What is a webhook, and how is it used in a CI/CD pipeline?

@@ -176,6 +176,8 @@ The difference between SIGTERM (`kill -15` / default) and SIGKILL (`kill -9`):
 pgrep nginx && echo "still running" || echo "stopped"
 ```
 
+> **Also asked as:** "How to check one running process?" — covered above (`ps aux | grep <name>` or `pgrep <name>`).
+
 ---
 
 ## 5. How do you check disk usage and free memory?
@@ -333,6 +335,8 @@ chmod 400 my-ec2-key.pem
 # If permissions are too open (e.g., 644), SSH refuses to use the key:
 # "Permissions 0644 for 'my-ec2-key.pem' are too open."
 ```
+
+> **Also asked as:** "If I provide chmod 755, what exactly will happen?" — covered above (owner: rwx, group: r-x, others: r-x).
 
 ---
 
@@ -625,3 +629,101 @@ atrm 1
 
 Always use absolute paths in crontab — cron runs with a minimal environment and doesn't know your `PATH`.
 
+
+---
+
+## 14. What is the one-liner command to delete or wipe out a log file?
+
+```bash
+# Option 1: Truncate the file to zero bytes (file remains, content wiped)
+> /var/log/app/error.log
+
+# Option 2: Same using truncate command
+truncate -s 0 /var/log/app/error.log
+
+# Option 3: Using tee
+: | tee /var/log/app/error.log
+
+# Option 4: Permanently delete the file
+rm /var/log/app/error.log
+```
+
+**The difference between truncating and deleting:**
+
+```bash
+# Truncate (> filename) — keeps the file, wipes content
+# Use this when: a running process (nginx, apache) has the file open
+# If you rm a file that a process has open, the process keeps writing to the
+# deleted inode — disk space is NOT freed until the process closes the file
+# Truncating the file frees the content but keeps the file descriptor valid
+
+# Delete (rm) — removes the file entirely
+# Use this when: no process has the file open, or you want to recreate it fresh
+```
+
+**Wipe all log files in a directory (one-liner):**
+
+```bash
+# Truncate all .log files in a directory
+find /var/log/myapp/ -name "*.log" -exec truncate -s 0 {} \;
+
+# Delete all .log files older than 7 days
+find /var/log/myapp/ -name "*.log" -mtime +7 -delete
+```
+
+**For production log rotation, use `logrotate` instead of manual deletion:**
+
+```bash
+# /etc/logrotate.d/myapp
+/var/log/myapp/*.log {
+    daily
+    rotate 7        # Keep 7 days of logs
+    compress        # gzip old logs
+    missingok       # Don't error if log file missing
+    notifempty      # Don't rotate if file is empty
+    postrotate
+        systemctl reload myapp   # Tell the app to reopen its log file
+    endscript
+}
+```
+
+---
+
+## 15. What is the command to check listening ports in Linux?
+
+```bash
+# Option 1: ss (modern, preferred over netstat)
+ss -tlnp
+# -t = TCP
+# -l = listening only
+# -n = show port numbers (not service names)
+# -p = show process name/PID
+
+# Output:
+# State   Recv-Q  Send-Q  Local Address:Port   Peer Address:Port  Process
+# LISTEN  0       128     0.0.0.0:22            0.0.0.0:*          sshd
+# LISTEN  0       511     0.0.0.0:80            0.0.0.0:*          nginx
+# LISTEN  0       128     127.0.0.1:5432        0.0.0.0:*          postgres
+
+# Option 2: netstat (older, may need net-tools package)
+netstat -tlnp
+
+# Option 3: check a specific port
+ss -tlnp | grep :8080
+
+# Option 4: lsof — show which process is using a port
+lsof -i :8080
+# COMMAND  PID     USER  FD  TYPE  DEVICE  SIZE  NODE  NAME
+# java     1234    app   45u IPv4  12345   0t0   TCP   *:8080 (LISTEN)
+
+# Option 5: check if a specific port is open (from the same machine)
+nc -zv localhost 8080
+# Connection to localhost 8080 port [tcp/*] succeeded!
+```
+
+**Check all listening ports (TCP + UDP):**
+
+```bash
+ss -tulnp
+# -u = include UDP as well
+```
