@@ -399,3 +399,66 @@ aws cloudwatch get-metric-statistics --namespace AWS/NatGateway \
 We ran a monthly cleanup script and found $400/month in orphaned EBS volumes from terminated nodes, unused ECR images, and old snapshots.
 
 **Real results:** Starting point: $18,000/month AWS bill for our EKS platform. After: right-sizing (−30%), spot migration (−25% on worker nodes), Karpenter (−15% idle node time), VPC endpoints (−$800), Savings Plans (−$1,200), orphan cleanup (−$400). 12 months later: $10,500/month. 42% reduction without removing any capability.
+
+---
+
+## 4. How to use VPC Flow Logs to trace a dropped connection
+
+> **Also asked as:** "How to use VPC Flow Logs to trace a dropped connection"
+
+When an application times out connecting to a database, the network is always blamed first. VPC Flow Logs are the source of truth for whether the network actually dropped the packet or if the application ignored it.
+
+**The Setup:**
+VPC Flow Logs capture IP traffic going to and from network interfaces in your VPC. They are published to CloudWatch Logs or S3.
+
+**The Scenario:** 
+An EC2 instance (App) in Subnet A cannot connect to an RDS instance (DB) in Subnet B on port 5432.
+
+**Step 1: Get the IPs and ENIs**
+Find the private IP of the App instance (e.g., `10.0.1.50`) and the private IP of the RDS instance (e.g., `10.0.2.100`).
+
+**Step 2: Query CloudWatch Logs Insights**
+Open the log group for your VPC Flow Logs and run this query to filter for traffic between these two IPs on port 5432:
+
+```text
+fields @timestamp, srcAddr, dstAddr, srcPort, dstPort, action, status
+| filter (srcAddr = '10.0.1.50' and dstAddr = '10.0.2.100' and dstPort = 5432)
+| sort @timestamp desc
+| limit 20
+```
+
+**Step 3: Analyze the `action` field**
+There are two possible outcomes in the logs:
+
+- **Scenario A: `REJECT`**
+  If the action is `REJECT`, the network blocked it.
+  *Root cause:* Look at the Security Groups and Network ACLs. 99% of the time, the App's Security Group is missing an outbound rule to the DB, or the DB's Security Group is missing an inbound rule from the App's Security Group ID.
+
+- **Scenario B: `ACCEPT`**
+  If the action is `ACCEPT`, the network delivered the packet successfully.
+  *Root cause:* The network is fine. The database server is either down, actively refusing connections (e.g., PostgreSQL `pg_hba.conf` issue), or the connection pool is maxed out. Stop looking at AWS networking and start looking at the database logs.
+
+**Why this matters in an interview:** It proves you don't just guess by clicking around the AWS console. You definitively prove where the packet died using data.
+
+---
+
+## 5. Architectural scenario: Read Replicas vs. ElastiCache
+
+> **Also asked as:** "Architectural scenario: Read Replicas vs. ElastiCache"
+
+When a database component becomes the bottleneck due to high read volume, you have two primary scaling options: RDS Read Replicas or an ElastiCache (Redis/Memcached) layer. Choosing the wrong one introduces unnecessary complexity or fails to solve the latency problem.
+
+**When to choose RDS Read Replicas:**
+- **The Problem:** CPU usage on the primary database is at 90% because of complex, heavy `SELECT` queries (e.g., generating weekly reports, BI dashboards, or complex table joins).
+- **The Data Pattern:** Operations require standard SQL relationships, transaction support, and querying against real-time (or near real-time) row data.
+- **The Implementation:** You spin up an RDS Read Replica. You change the application code to route "Write" operations (`INSERT`, `UPDATE`, `DELETE`) to the primary endpoint, and "Read" operations (`SELECT`) to the reader endpoint.
+- **Latency Profile:** Read Replicas improve *throughput* (handling more concurrent queries), but they do not significantly improve the *latency* of an individual complex query. If a heavy JOIN takes 2 seconds to run on the primary, it will still take 2 seconds on the replica.
+
+**When to choose ElastiCache (Redis):**
+- **The Problem:** The database is overwhelmed by millions of identical, simple queries being run repeatedly (e.g., loading the top 10 products on a homepage, fetching a user's session profile).
+- **The Data Pattern:** Key-value lookups where the data doesn't change every second.
+- **The Implementation:** You put Redis in front of the database. The application checks Redis first (`GET user:123`). If it's a "cache hit", it returns instantly. If it's a "cache miss", it queries RDS, stores the result in Redis (`SET user:123 result EX 300`), and then returns it.
+- **Latency Profile:** Redis operates in sub-millisecond territory (in-memory). It drastically improves both *throughput and latency*. A query that took 50ms in RDS now takes 0.5ms.
+
+**The Hybrid Approach (The standard for scale):**
+You use *both*. The application reads user sessions and homepage catalogs from Redis. When a user runs a complex search query that bypasses the cache, that query hits the RDS Read Replica. The RDS Primary is reserved exclusively for processing financial transactions and user updates.

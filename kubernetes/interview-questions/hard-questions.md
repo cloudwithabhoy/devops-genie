@@ -6,6 +6,8 @@ Advanced-level Kubernetes interview questions and answers.
 
 ## 1. Walk me through what the controller manager does during a Deployment. No rollout status — reconciliation logic.
 
+> **Also asked as:** "What does the Kubernetes controller manager do during a Deployment? Not kubectl rollout status. Tell me about reconciliation, desired vs actual state, informers, and watch loops."
+
 Three controllers work in a chain: **Deployment Controller → ReplicaSet Controller → Scheduler + Kubelet**. Each runs an independent reconciliation loop — compare desired vs actual, take action on the diff.
 
 **Deployment Controller** watches Deployment objects via informers (not polling — it gets events pushed). When you `kubectl apply` a Deployment with a changed pod template, it computes a new template hash, creates a new ReplicaSet, and starts scaling the old RS down. It never touches pods directly — it only manages ReplicaSets.
@@ -24,6 +26,8 @@ Three controllers work in a chain: **Deployment Controller → ReplicaSet Contro
 
 ## 2. How do you enforce runtime security in Kubernetes?
 
+> **Also asked as:** "How do you enforce runtime security in Kubernetes? PSP? OPA? Kyverno? AppArmor? Or are you still hoping RBAC will protect your pods?"
+
 It's layered. Anyone who says "we use OPA" and stops there is covering one layer.
 
 **Admission layer** — Pod Security Admission (replaced PSP in v1.25) with three profiles: `privileged`, `baseline`, `restricted`. We enforce `restricted` on all prod namespaces. For custom rules, we use **Kyverno** — block `latest` tag, require resource limits, restrict image registries. Example: A developer once tried to deploy a container from Docker Hub directly in production. Kyverno blocked it instantly with a clear message: "images must come from 123456789.dkr.ecr.us-east-1.amazonaws.com."
@@ -41,6 +45,8 @@ It's layered. Anyone who says "we use OPA" and stops there is covering one layer
 ---
 
 ## 3. HPA vs VPA vs Karpenter — when would you NOT use each?
+
+> **Also asked as:** "HPA vs VPA vs Karpenter — when do you NOT use each? Bonus: How would you simulate HPA behavior in staging without real traffic?"
 
 **Don't use HPA when:**
 - App isn't horizontally scalable — databases, single-instance Redis, Kafka Connect workers with partition assignments. Adding replicas doesn't distribute load automatically.
@@ -126,6 +132,8 @@ Real scenario: A junior developer had `cluster-admin` in production (inherited f
 ---
 
 ## 6. How do you debug NetworkPolicy issues step by step?
+
+> **Also asked as:** "NetworkPolicy debugging steps"
 
 NetworkPolicies are stateless YAML — they either match or they don't. No error messages, no logs. Traffic just silently drops. That's what makes debugging them painful.
 
@@ -241,6 +249,8 @@ App manages its own TLS certificates. Most control but most work. Use cert-manag
 ---
 
 ## 8. How would you simulate a DNS failure in CoreDNS to test application resilience?
+
+> **Also asked as:** "How to simulate a DNS failure in CoreDNS?"
 
 This is a chaos engineering question. You want to verify that applications handle DNS failures gracefully — with retries, timeouts, and fallbacks — instead of crashing.
 
@@ -1610,3 +1620,62 @@ ArgoCD's sync preview shows exactly what will change before apply — like `terr
 **Real scenario:** A developer updated a Helm values file and accidentally set `resources.limits.memory: 128` (integer, not string). Helm rendered it as an invalid manifest. Without CI validation, this deployed fine on staging (which had no LimitRange enforcement) but failed on production during the next deployment. After adding `kubeconform` to the PR pipeline, this class of error gets caught in under 30 seconds — before code review even begins.
 
 ---
+
+## 30. Debugging stuck pods & taints/tolerations
+
+> **Also asked as:** "Debugging stuck pods & taints/tolerations"
+
+When a pod is "stuck," it usually means it is stuck in the `Pending` state. The pod object exists in etcd, but the Scheduler cannot find a node to place it on.
+
+**Step 1: Ask the Scheduler**
+`kubectl describe pod <stuck-pod>`
+Look at the very bottom, in the `Events` section. The scheduler will tell you exactly why it failed:
+- `0/10 nodes are available: 3 node(s) had taint {node-role.kubernetes.io/master: }, that the pod didn't tolerate...`
+- `0/10 nodes are available: 7 Insufficient cpu.`
+
+**Step 2: Taints vs Tolerations**
+A Taint is applied to a **Node**. It repels pods. (Think: "I am a GPU node, keep away unless you really need a GPU").
+A Toleration is applied to a **Pod**. It allows the pod to ignore the taint. (Think: "I tolerate the GPU node taint").
+If your pod is pending because of a Taint, you must either:
+1. Add the matching Toleration to your Pod Spec.
+2. Remove the Taint from the node (`kubectl taint nodes <node-name> <taint-key>-`).
+
+**Step 3: Affinity and Anti-Affinity Rules**
+Sometimes the scheduler is blocked by your own rules.
+- **Node Affinity:** "I must run on a node with label `disktype=ssd`". If no nodes have that label, the pod stays Pending.
+- **Pod Anti-Affinity:** "I cannot run on the same node as another pod with label `app=database`". If every node already has a database pod, your new pod stays Pending.
+
+**Step 4: PVC Binding Issues**
+If the pod requires a PersistentVolumeClaim, the pod will remain Pending until the PVC is bound to a PV. 
+Check `kubectl get pvc`. If the PVC is also Pending, check the StorageClass and the CSI driver logs.
+
+---
+
+## 31. Implement pod-to-pod TLS encryption in Kubernetes
+
+> **Also asked as:** "Implement pod-to-pod TLS encryption in Kubernetes"
+
+Implementing TLS encryption (mTLS - mutual TLS) at the application layer in Kubernetes is an **anti-pattern**. It requires managing certificates, rotating them, and updating application code across every microservice. 
+
+**The modern approach: Do it at the Network or Mesh layer.**
+
+**1. Service Mesh (Istio / Linkerd):**
+This is the most common enterprise solution.
+- The mesh injects a lightweight sidecar proxy (Envoy or Linkerd-proxy) into every pod.
+- Application A sends plain HTTP to Application B.
+- The sidecar intercepts the traffic, encrypts it via mTLS using certificates provided by the mesh control plane, and sends it to B's sidecar.
+- B's sidecar decrypts it and forwards plain HTTP to Application B.
+- **Result:** Zero code changes. Full end-to-end encryption on the wire.
+
+**2. Network Plugin (Cilium):**
+If you don't want the overhead of sidecar proxies, you can encrypt at the kernel layer.
+- Cilium uses eBPF for networking. You can enable transparent IPsec or WireGuard encryption globally across the cluster.
+- All node-to-node and pod-to-pod traffic is encrypted automatically by the Linux kernel. No sidecars required.
+
+**3. cert-manager + CSI Driver (The "App Layer" hybrid):**
+If you absolutely must have the application terminate the TLS (perhaps for strict compliance reasons), do not mount static secrets.
+- Use `cert-manager` paired with the `csi-driver-spiffe`.
+- The CSI driver automatically requests a short-lived certificate for the specific pod identity and mounts it into the pod's filesystem as a volume.
+- `cert-manager` handles rotation automatically before the certificate expires. 
+
+**Summary in an interview:** "I would use Linkerd or Istio to enforce strict mTLS via sidecars, keeping the encryption logic entirely decoupled from the application code."

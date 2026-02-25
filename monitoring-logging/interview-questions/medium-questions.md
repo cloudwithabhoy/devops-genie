@@ -5,6 +5,7 @@
 ## 1. What is the difference between metrics, logs, and traces — and when do you start with each?
 
 > **Also asked as:** "Can you explain logs, metrics, and traces?"
+> **Also asked as:** "Explain the monitoring tools you used and difference in metrices, logs and traces ?"
 
 These are the three pillars of observability. Most people can define them; the real answer is knowing which one to reach for first in different scenarios.
 

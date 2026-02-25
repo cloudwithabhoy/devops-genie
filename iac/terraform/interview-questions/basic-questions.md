@@ -320,3 +320,83 @@ We use Terraform for everything — AWS infrastructure, Kubernetes resources (vi
 
 **Real scenario:** We inherited a project that used CloudFormation for VPC/EC2 and Terraform for EKS/Kubernetes. Any change that involved both layers (adding a subnet AND deploying a service to it) required two separate PRs, two separate applies, and careful ordering. We migrated everything to Terraform over 3 weeks — VPC moved first, then EC2, then Route53. Each migration was a `terraform import` of existing resources. After migration: one PR, one pipeline, one apply. Deployment time for infrastructure changes dropped from 45 minutes (two sequential pipeline runs) to 15 minutes (one run).
 
+---
+
+## 4. What is state management in Terraform?
+
+> **Also asked as:** "Where you will keep your stateful file ?"
+
+State management is how Terraform keeps track of the real-world infrastructure it has provisioned and maps it to your configuration files.
+
+When you run `terraform apply`, Terraform creates an `aws_instance` in AWS. Terraform needs a way to remember that "the EC2 instance `i-0abcdef123` in AWS belongs to the resource block `aws_instance.app` in my code." It stores this mapping in the **state file** (`terraform.tfstate`), which is a large JSON document.
+
+**Why state is critical:**
+1. **Mapping Configuration to Reality:** If you change your code to add a tag, Terraform checks the state to know exactly which AWS resource to update.
+2. **Detecting Drift:** When you run `terraform plan`, Terraform compares what's in the state file with what's actually running in the cloud. If an engineer manually deleted a security group that is in the state file, Terraform knows it's missing and will propose recreating it.
+3. **Dependency Resolution:** The state file holds the output attributes of resources (like the auto-generated AMI ID or IP address) so other resources can depend on them.
+4. **Destroying Resources:** When you remove a block of code, Terraform uses the state file to find the corresponding real-world resource and destroy it.
+
+**Production State Management:**
+In production, you **never** store the state file locally on your laptop. If your hard drive crashes, Terraform completely loses track of the infrastructure. Instead, you use a **Remote Backend**:
+
+1. **Remote Storage (e.g., AWS S3):** The state file is stored centrally in an S3 bucket so the entire team and the CI/CD pipeline share the single source of truth.
+2. **State Locking (e.g., DynamoDB):** If two developers run `terraform apply` at the exact same time, it can corrupt the state or cause race conditions. A DynamoDB table is used to "lock" the state. The first apply acquires the lock, and the second apply is rejected until the first finishes.
+
+---
+
+## 5. Explain terraform structure ?
+
+> **Also asked as:** "Explain terraform structure ?"
+
+Terraform doesn't enforce a specific directory structure. You could put 10,000 lines of HCL into one giant `main.tf` file, and Terraform would parse it perfectly. However, for human readability and maintainability, the industry relies on a standard modular structure.
+
+**The Standard Root Module Structure:**
+Every Terraform project should at minimum be split into these files:
+
+```text
+my-project/
+├── main.tf        # The actual resources being created (EC2, S3, VPC)
+├── variables.tf   # Input variables (declarations, types, and defaults)
+├── outputs.tf     # What information to print out after an apply (e.g., ALB URL)
+├── providers.tf   # Provider configurations (AWS region, versions)
+├── backend.tf     # Where to store the remote state file (S3 + DynamoDB)
+└── terraform.tfvars # (Optional) Environment-specific values passed locally
+```
+
+**Why split them up?**
+If I want to know exactly what this Terraform project *requires* to run, I look at `variables.tf`. If I want to know what it *gives back*, I look at `outputs.tf`. I don't have to scroll through 800 lines of `main.tf` to find what I need.
+
+**The Enterprise Module Structure:**
+When managing complex infrastructure, we never put everything in the "root" folder. We break infrastructure down into reusable **Modules** (like functions in programming).
+
+```text
+infrastructure/
+├── environments/
+│   ├── dev/
+│   │   └── main.tf        # Calls the generic modules, passing in "dev" variables
+│   └── prod/
+│       └── main.tf        # Calls the generic modules, passing in "prod" variables
+│
+└── modules/               # Reusable blocks of code
+    ├── vpc/
+    │   ├── main.tf
+    │   ├── variables.tf
+    │   └── outputs.tf
+    ├── database/
+    │   ├── main.tf
+    │   ├── variables.tf
+    │   └── outputs.tf
+    └── web-app/
+```
+
+In this structure, the definitions in `environments/prod/main.tf` are incredibly short. They just call the modules:
+
+```hcl
+module "production_vpc" {
+  source     = "../../modules/vpc"
+  cidr_block = "10.0.0.0/16"
+  env_name   = "prod"
+}
+```
+This guarantees that `dev` and `prod` share the exact same architectural components, differing only by the variable inputs.
+

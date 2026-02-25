@@ -6,6 +6,8 @@ Real-world Kubernetes production issues, debugging steps, and solutions.
 
 ## 1. What happens if a node with local storage gets autoscaled down?
 
+> **Also asked as:** "What happens when a node with local emptyDir volumes gets scaled down? Be careful. I've seen stateful apps lose months of data from this in prod."
+
 **The data is gone. Permanently.** No migration, no backup, no warning to the application.
 
 `emptyDir`, `hostPath`, and `local` PersistentVolumes are all tied to the node's lifecycle. When the cluster autoscaler terminates that node, the disk is destroyed with the VM.
@@ -105,6 +107,8 @@ initContainers:
 ---
 
 ## 5. How do you detect and fix OOMKilled pods in production?
+
+> **Also asked as:** "How do you detect and fix OOMKilled issues?"
 
 OOMKilled means the container used more memory than its `resources.limits.memory`. The Linux kernel's OOM killer terminates the process — no graceful shutdown, no SIGTERM, just instant death.
 

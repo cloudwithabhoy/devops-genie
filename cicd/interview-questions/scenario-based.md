@@ -4,6 +4,8 @@
 
 ## 1. Explain your project architecture.
 
+> **Also asked as:** "What are microservices and explain you used in your previous company projects ?"
+
 I always frame this around the problem we were solving, not the tools we picked.
 
 **Context:** We ran a microservices platform — about 18 services, team of 12 engineers, deploying to AWS EKS. The old setup was manual deployments over SSH, zero rollback capability, and a shared staging environment that was permanently broken because everyone used it at the same time.
@@ -32,6 +34,9 @@ CD is handled by ArgoCD in a GitOps model. Jenkins never touches the cluster dir
 ---
 
 ## 2. Walk me through the CI/CD flow you followed in your project.
+
+> **Also asked as:** "How to configure CI/CD using Jenkins ?"
+> **Also asked as:** "How is the CI/CD pipeline is setup in your project? What are the security tools integrated?"
 
 End to end — from a developer pushing code to users getting the update — this is the exact flow we ran in production.
 
@@ -113,6 +118,8 @@ This question is checking breadth of experience. The answer should cover differe
 ---
 
 ## 4. Which deployment tools have you used — Docker, Kubernetes, Helm, Terraform?
+
+> **Also asked as:** "How do you deploy microservices in AWS ?"
 
 This is a "show me you've actually used these together, not just in isolation" question.
 
@@ -470,3 +477,51 @@ The EC2 instance is healthy → ALB routes traffic to it → users access `http:
 - **GitHub token (PAT)** — authenticates the request (replaces password). Used when the repository is private, when the EC2 does a `git pull` on startup, or when a script clones the repo. In GitHub Actions itself, `GITHUB_TOKEN` is auto-provided for same-repo operations — you only need a PAT for cross-repo access or external scripts.
 
 **Security note:** Never hardcode the token in the workflow YAML or in scripts committed to the repo. Always store it in GitHub Secrets or AWS Secrets Manager.
+
+---
+
+## 8. Blue/Green vs Canary rollout — when to pick what?
+
+> **Also asked as:** "Blue/Green vs Canary rollout — when to pick what?"
+> **Also asked as:** "How do you ensure continuous deployment and zero downtime for microservices ?"
+
+Both reduce deployment risk compared to a standard Rolling Update, but they optimize for completely different things.
+
+### Blue/Green Deployment (The "Switch")
+You run two identical environments. Blue is serving prod traffic. You deploy the new code to Green, run tests on Green safely, and then flip the load balancer router to send 100% of traffic to Green.
+- **When to use it:** Legacy monoliths, heavy stateful applications, or deployments involving major breaking schema changes.
+- **The Tradeoff:** You need 200% of the infrastructure capacity during the deployment. It's expensive.
+- **The Rollback:** Instantaneous. Flip the router back to Blue.
+
+### Canary Deployment (The "Blast Radius")
+You deploy the new version alongside the old version. You route just 1% of live user traffic to the new version. You monitor error rates and latency. If metrics are healthy, you scale up to 10%, 25%, 50%, 100%. If metrics spike, you automatically abort and route back to the old version.
+- **When to use it:** Modern microservices, SaaS platforms, high-traffic consumer apps.
+- **The Tradeoff:** Requires excellent observability infrastructure (Prometheus/Datadog) to make automated go/no-go decisions. You are testing in production, which means that 1% of users *will* experience errors if the code is broken.
+- **The Rollback:** Gradual routing rollback, but automated.
+
+**Summary:** If your app takes 10 minutes to boot up and connects to a legacy database, use Blue/Green. If you deploy a lightweight Go microservice 10 times a day, use Canary via Argo Rollouts.
+
+---
+
+## 9. Describe Vault + GitHub Actions integration securely
+
+> **Also asked as:** "Describe Vault + GitHub Actions integration securely"
+
+Integrating HashiCorp Vault with GitHub Actions is a classic "Secret Zero" problem. How does the pipeline authenticate to Vault without us hardcoding a Vault token inside a GitHub Secret?
+
+**The Anti-Pattern:** Generating a long-lived Vault AppRole Token and saving it in GitHub Secrets. If that secret leaks, the attacker has permanent access to Vault.
+
+**The Modern Solution: OIDC (OpenID Connect)**
+You establish a trust relationship between Vault and GitHub based on identity, not passwords.
+
+1. **GitHub Context:** Every run of a GitHub Action generates a short-lived JSON Web Token (JWT) signed by GitHub's private key. This token contains metadata about the job (`repository: my-org/my-repo`, `ref: refs/heads/main`).
+2. **Vault Configuration:** You configure Vault's OIDC auth method to trust GitHub's public OIDC endpoints (`https://token.actions.githubusercontent.com`).
+3. **The Bind:** You create a Vault Role that says: "If a JWT comes in, verified by GitHub's public key, and the repository is exactly `my-org/my-repo` and the branch is `main`, assign them the `prod-deployer` Vault policy."
+4. **The Pipeline Run:** 
+   - GitHub Actions requests the Vault JWT.
+   - It sends the JWT to Vault.
+   - Vault cryptographically verifies the signature with GitHub.
+   - Vault issues a short-lived, ephemeral Vault Token to the pipeline (valid for maybe 5 minutes).
+   - The pipeline fetches the secrets and exits. The token expires immediately.
+
+**Why this matters in an interview:** It proves you understand identity federation. There are no passwords to rotate, no long-lived tokens to steal, and access is tied definitively to the execution of code on the `main` branch.

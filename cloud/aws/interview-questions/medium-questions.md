@@ -160,6 +160,8 @@ We gave a CI/CD service account `iam:*` permissions so it could create roles for
 
 ## 2. Explain VPC concepts in AWS.
 
+> **Also asked as:** "Tell me about the VPC structure setup in your project."
+
 VPC (Virtual Private Cloud) is your isolated network inside AWS. Every EC2 instance, RDS database, Lambda in a VPC, and EKS node lives inside one. Understanding VPC is non-negotiable for any DevOps role.
 
 **The core building blocks:**
@@ -722,9 +724,85 @@ Exceptions:
 
 ---
 
-## 10. What is AWS Auto Scaling Groups and what are its use cases?
+## 10. What is Autoscaling ? How you used in your previous projects without UI based ?
+
+> **Also asked as:** "What is AWS Auto Scaling Groups and what are its use cases?"
+> **Also asked as:** "What is Autoscaling ? How you used in your previous projects without UI based ?"
 
 An Auto Scaling Group (ASG) is AWS's mechanism for automatically adjusting the number of EC2 instances in a group based on demand, schedules, or metrics. The ASG ensures you always have the right number of instances — not too few (degraded availability) and not too many (wasted cost).
+
+**How to use it "Without UI based" (Infrastructure as Code)**
+In modern DevOps, we never configure Autoscaling in the AWS Management Console (the UI). Clicking through the console is error-prone, untrackable, and non-repeatable.
+
+Instead, we define the entire Autoscaling configuration using Terraform. 
+
+**The Terraform Implementation:**
+To create an ASG without the UI, you need two main components: a **Launch Template** (what to launch) and the **Auto Scaling Group** itself (how/when to launch).
+
+```hcl
+# 1. First, define WHAT to launch (The Launch Template)
+resource "aws_launch_template" "app_server" {
+  name_prefix   = "app-server-"
+  image_id      = "ami-0abcdef1234567890" # Amazon Linux 2023
+  instance_type = "t3.medium"
+  
+  # Connect the EC2 instances to the correct Security Group
+  vpc_security_group_ids = ["sg-0123456789abcdef0"]
+
+  # Give the EC2 instances an IAM role (e.g., to read from S3)
+  iam_instance_profile {
+    name = "app-server-role"
+  }
+
+  # User Data script that runs on startup (installs Docker and pulls the app)
+  user_data = base64encode(<<-EOF
+              #!/bin/bash
+              yum update -y
+              amazon-linux-extras install docker -y
+              service docker start
+              docker run -d -p 80:80 my-registry/my-app:latest
+              EOF
+  )
+}
+
+# 2. Second, define the Auto Scaling Group behavior
+resource "aws_autoscaling_group" "app" {
+  name                = "app-asg"
+  vpc_zone_identifier = ["subnet-abc", "subnet-def"] # Private subnets
+  
+  # The scaling bounds
+  min_size         = 2  # Never drop below 2 instances (High Availability)
+  desired_capacity = 2  # Start with 2
+  max_size         = 10 # Never exceed 10 instances (Cost Control)
+
+  # Attach it to an Application Load Balancer
+  target_group_arns = ["arn:aws:elasticloadbalancing:region:account-id:targetgroup/my-tg/xyz"]
+
+  launch_template {
+    id      = aws_launch_template.app_server.id
+    version = "$Latest"
+  }
+}
+
+# 3. Third, define WHEN to scale (Target Tracking Policy)
+resource "aws_autoscaling_policy" "cpu_tracking" {
+  name                   = "cpu-target-tracking"
+  autoscaling_group_name = aws_autoscaling_group.app.name
+  policy_type            = "TargetTrackingScaling"
+
+  target_tracking_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ASGAverageCPUUtilization"
+    }
+    # Tell AWS: "Maintain the average CPU across all instances at exactly 70%"
+    target_value = 70.0
+    # If average CPU hits 75%, AWS provisions a new instance
+    # If average CPU drops to 30%, AWS terminates an instance
+  }
+}
+```
+
+By deploying this Terraform code from a CI/CD pipeline, the Auto Scaling Group is provisioned entirely programmatically ("without UI based"). If we need to change the instance type from `t3.medium` to `m5.large`, we simply update the Terraform code, raise a PR, and the pipeline rolls out the change automatically.
 
 **The core model:**
 

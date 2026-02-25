@@ -152,9 +152,9 @@ When people say "the pod restarted," what actually happened is the **container i
 
 ---
 
-## 6. Difference between readiness and liveness probes, and how each can break production.
+## 5. What are Liveness and Readiness Probes?
 
-> **Also asked as:** "What is the difference between liveness and readiness probes?"
+> **Also asked as:** "What is the difference between liveness and readiness probes?" · "What breaks if readinessProbe is wrong?"
 
 Both are health checks, but they serve opposite purposes:
 
@@ -346,6 +346,8 @@ When a PVC requests `storageClassName: fast`, EKS automatically creates a gp3 EB
 ---
 
 ## 10. Difference between ConfigMap and Secret
+
+> **Also asked as:** "Use case for ConfigMap vs Secret"
 
 > **Also asked as:** "What is the role of a Kubernetes ConfigMap?"
 
@@ -611,6 +613,8 @@ spec:
 
 ## 15. What's the difference between `kubectl exec`, `kubectl logs`, and `kubectl describe`? When do you use each?
 
+> **Also asked as:** "Difference between kubectl exec, logs, describe — when to use what?"
+
 They serve completely different purposes — think of them as three different levels of investigation.
 
 **`kubectl logs <pod>`** — Shows stdout/stderr from the container. This is your **first stop** for application errors. Use `--previous` to see logs from a crashed container, `-f` to stream live logs, and `-c <container>` for multi-container pods.
@@ -632,6 +636,8 @@ When to use: Need to debug networking (`curl`, `nslookup`), check if config file
 ---
 
 ## 16. What are manifest files in Kubernetes?
+
+> **Also asked as:** "What are manifest files?"
 
 Manifest files are YAML (or JSON) files that declare the **desired state** of your Kubernetes resources. You write what you want, and Kubernetes makes it happen.
 
@@ -1172,3 +1178,32 @@ For internal service-to-service communication, everything uses `ClusterIP` — n
 - If you're on a bare-metal cluster without a cloud provider — use MetalLB to get LoadBalancer functionality, or use NodePort + an external load balancer
 
 ---
+
+## 17. What is Node Affinity and Pod Affinity in Kubernetes?
+
+Both are scheduling features that tell the Kubernetes scheduler where to place your Pods, but they are evaluated against different targets.
+
+**Node Affinity (Pod → Node relationship):**
+- **What it does:** Attracts Pods to specific *Nodes* based on Node labels. It is essentially an advanced, more expressive version of `nodeSelector`.
+- **Types:** `requiredDuringScheduling` (hard requirement) and `preferredDuringScheduling` (soft preference).
+- **Use case:** "Schedule this machine learning Pod only on Nodes that have the label `gpu=nvidia`."
+
+**Pod Affinity and Anti-Affinity (Pod → Pod relationship):**
+- **What it does:** Attracts (Affinity) or repels (Anti-Affinity) Pods based on the labels of *other Pods* already running on a Node (or across a topology, like an Availability Zone).
+- **Pod Affinity Use Case:** "Schedule this web server Pod on the same Node (or AZ) as its Redis cache Pod to reduce network latency."
+- **Pod Anti-Affinity Use Case:** "Do not schedule these three API replicas on the same Node. Spread them out so that if one Node crashes, we don't lose the whole API." (This ensures high availability).
+
+---
+
+## 18. What is HPA in Kubernetes and how does it work?
+
+**HPA (Horizontal Pod Autoscaler)** is a Kubernetes control loop that automatically scales the number of Pod replicas in a Deployment, ReplicaSet, or StatefulSet based on observed metrics (most commonly CPU or Memory utilization).
+
+**How it works:**
+1. **Metrics Collection:** The HPA continuously queries the Kubernetes Metrics Server (or a custom metrics adapter like Prometheus Adapter) at regular intervals (default 15 seconds) to get the current resource usage of the Pods.
+2. **Evaluation:** It calculates the desired number of replicas by comparing the current usage against the target utilization you defined (e.g., Target: 70% average CPU).
+    - Formula: `desiredReplicas = ceil[currentReplicas * ( currentMetricValue / desiredMetricValue )]`
+3. **Scaling:** If the calculated desired number is higher or lower than the current number of replicas, the HPA updates the `spec.replicas` field of the target Deployment.
+4. **Stabilization:** To prevent thrashing (rapidly scaling up and down due to fluctuating load), the HPA uses stabilization windows (e.g., waiting 5 minutes before scaling down).
+
+*Real Scenario:* An e-commerce API normally requires 3 Pods. During a flash sale, average CPU usage spikes to 90%. The HPA detects this, calculates that it needs 6 Pods to get CPU back down to the 60% target, and automatically scales the Deployment to 6 replicas. When the sale ends, it scales back down to 3, saving cloud costs.

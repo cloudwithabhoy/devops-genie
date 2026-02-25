@@ -253,6 +253,117 @@ resource "aws_route_table_association" "public" {
   route_table_id = aws_route_table.public.id
 }
 
+resource "aws_security_group" "web" {
+  vpc_id      = aws_vpc.main.id
+  description = "Allow inbound HTTP/HTTPS"
+
+  ingress {
+    description = "HTTP from anywhere"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_instance" "web" {
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = "t3.micro"
+  subnet_id              = aws_subnet.public.id
+  vpc_security_group_ids = [aws_security_group.web.id]
+
+  # map_public_ip_on_launch ensures this instance gets a public IP
+}
+```
+
+---
+
+## 4. What is ECS & EKS ?
+
+> **Also asked as:** "What is ECS & EKS ?"
+
+Both are AWS container orchestration services, but they target different engineering cultures.
+
+**Amazon ECS (Elastic Container Service):**
+ECS is the AWS-native way to run Docker containers. It was built by AWS, for AWS.
+- **Complexity:** Low. It consists of Clusters, Services, and Tasks. Very easy to learn.
+- **Integration:** Extremely tight integration with AWS ALB, IAM, CloudWatch, and Secrets Manager.
+- **Lock-in:** High. ECS task definitions are proprietary to AWS. You cannot run an ECS cluster on Azure or your local laptop.
+- **Best for:** Teams with little Kubernetes experience who just want to run containerized web apps on AWS with minimum operational overhead.
+
+**Amazon EKS (Elastic Kubernetes Service):**
+EKS is managed Kubernetes. AWS hosts the control plane, but everything else is standard open-source Kubernetes.
+- **Complexity:** High. Requires understanding Pods, Deployments, Services, Ingress, RBAC, and Helm.
+- **Integration:** Uses standard open-source tools (Prometheus, Grafana, Istio, nginx-ingress). AWS integration requires add-ons (like AWS Load Balancer Controller or EBS CSI drivers).
+- **Lock-in:** Low. A Kubernetes Deployment YAML file works on EKS, GKE (Google), AKS (Azure), or minikube on your laptop.
+- **Best for:** Large engineering organizations running microservices, teams prioritizing open-source tooling, or companies needing multi-cloud portability.
+
+---
+
+## 5. What are IAM roles ?
+
+> **Also asked as:** "What are IAM roles ?"
+> **Also asked as:** "What are IAM roles and policies?"
+
+An IAM Role is an identity with permission policies that determine what the identity can and cannot do in AWS. 
+
+Crucially, an IAM role does **not** have permanent credentials (no password, no access keys). Instead, it relies on dynamically generated, temporary security credentials.
+
+**Roles vs. Users:**
+- **IAM User:** Represents a specific person or service. Has long-term credentials (Access Key ID and Secret Access Key). If leaked, the attacker has permanent access until you revoke the key.
+- **IAM Role:** Represents a set of permissions. Can be "assumed" by anyone or anything that needs it (and is allowed to). Issues credentials that expire automatically (usually after 1 hour).
+
+**How we use them in DevOps (The primary use case is Infrastructure, not Humans):**
+If an EC2 instance needs to read from an S3 bucket, **never** generate an IAM User access key and hardcode it into the EC2 instance or application code. 
+
+Instead, create an IAM Role with AmazonS3ReadOnlyAccess, and attach that Role to the EC2 instance as an **Instance Profile**. The application running on the EC2 instance will automatically fetch temporary credentials from the AWS metadata service. There are no keys to leak, and no keys to manually rotate. EKS (via IRSA - IAM Roles for Service Accounts) and Lambda use this exact same pattern.
+
+---
+
+## 6. How to setup AWS CLI ?
+
+> **Also asked as:** "How to setup AWS CLI ?"
+
+There are multiple ways to authenticate the AWS CLI, ranging from quick-and-dirty to enterprise-secure.
+
+**Method 1: The Basic Setup (Long-lived credentials - Local Dev Only)**
+```bash
+aws configure
+# Prompts for:
+# AWS Access Key ID [None]: AKIAIOSFODNN7EXAMPLE
+# AWS Secret Access Key [None]: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+# Default region name [None]: us-east-1
+# Default output format [None]: json
+```
+This stores the plaintext keys in `~/.aws/credentials`. This is the easiest way to start, but frowned upon in enterprise environments because the keys never expire if forgotten.
+
+**Method 2: Environment Variables (CI/CD Pipelines)**
+In automated systems like Jenkins or GitHub Actions, you don't run `aws configure`. You inject the keys directly into the environment:
+```bash
+export AWS_ACCESS_KEY_ID="AKIAIOS..."
+export AWS_SECRET_ACCESS_KEY="wJalrXU..."
+export AWS_DEFAULT_REGION="us-east-1"
+aws s3 ls
+```
+
+**Method 3: AWS SSO / IAM Identity Center (Enterprise Standard)**
+Instead of managing permanent access keys, developers authenticate using their corporate SSO (like Okta or Azure AD).
+```bash
+aws configure sso
+```
+This opens a browser window. You log in with your corporate credentials, and AWS injects temporary, short-lived tokens into your CLI configuration. When the tokens expire (e.g., after 8 hours), you simply run `aws sso login` again. This is the gold standard for developer workstations.
+resource "aws_route_table_association" "public" {
+  subnet_id      = aws_subnet.public.id
+  route_table_id = aws_route_table.public.id
+}
+
 resource "aws_security_group" "ec2" {
   vpc_id = aws_vpc.main.id
 
@@ -779,3 +890,46 @@ ORDER BY total_orders DESC;
 | Flexible schema, JSON documents | Either (Postgres has JSONB) |
 | Serverless, automatic scaling | DynamoDB |
 | Existing relational data model | PostgreSQL |
+
+---
+
+## 14. How do you secure AWS credentials?
+
+Securing AWS credentials is the foundation of cloud security. Hardcoded or leaked credentials are the #1 cause of major cloud breaches.
+
+**1. Never hardcode credentials in code:**
+Do not put `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY` in source code, configuration files, or Dockerfiles. 
+
+**2. Use IAM Roles instead of IAM Users:**
+- **For EC2/EKS/Lambda:** Assign an IAM Role directly to the compute resource. The service retrieves temporary, automatically-rotated credentials from the AWS metadata service. There are no long-lived keys to leak.
+- **For CI/CD (GitHub Actions/GitLab):** Use OIDC (OpenID Connect) to assume an IAM Role rather than storing long-lived IAM User credentials in GitHub Secrets.
+
+**3. Use AWS Secrets Manager or Systems Manager Parameter Store:**
+If your application needs to authenticate with a third-party API or database, store those secrets in AWS Secrets Manager or Parameter Store. The application (acting under an IAM Role) fetches the secret at runtime.
+
+**4. Employ MFA and SSO (IAM Identity Center):**
+For human access, enforce Multi-Factor Authentication (MFA) and use AWS SSO (IAM Identity Center) to grant temporary access via identity providers (Okta, Azure AD) instead of distributing long-lived IAM User credentials.
+
+**5. Regularly rotate and audit:**
+If you must use long-lived keys (e.g., for legacy on-prem services), use AWS Access Analyzer and IAM credential reports to find and rotate keys older than 90 days.
+
+---
+
+## 15. What is the difference between ALB and NLB in AWS?
+
+Both are managed load balancers in AWS, but they operate at different layers of the OSI model and serve different use cases.
+
+**Application Load Balancer (ALB) - Layer 7 (HTTP/HTTPS):**
+- **Traffic:** Understands web traffic (HTTP, HTTPS, gRPC, WebSocket).
+- **Routing:** Can route traffic based on what's inside the request (URL path, hostname, HTTP headers, query strings).
+- **Features:** TLS termination, redirects, WAF integration, OIDC authentication before traffic reaches your app.
+- **Use case:** Web applications, microservices, APIs.
+
+**Network Load Balancer (NLB) - Layer 4 (TCP/UDP):**
+- **Traffic:** Routes based strictly on IP protocol data (TCP, UDP). Does not look at HTTP headers or paths.
+- **Performance:** Built to handle millions of requests per second with extremely low latency.
+- **Static IP:** Provides a static, Elastic IP address per Availability Zone (ALBs do not; their IPs change).
+- **Use case:** High-performance databases, non-HTTP applications (e.g., gaming servers, IoT MQTT brokers), or when you require a fixed ingress IP for whitelist purposes.
+
+**Summary:** 
+If you need routing rules based on `/api` vs `/web` or need to attach AWS WAF, use an **ALB**. If you need ultra-low latency, handling of raw TCP/UDP, or a static IP, use an **NLB**.

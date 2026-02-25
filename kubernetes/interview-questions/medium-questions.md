@@ -6,6 +6,8 @@ Intermediate-level Kubernetes interview questions and answers.
 
 ## 1. How does DNS resolution work inside a pod? And what do you check when a service isn't reachable by name?
 
+> **Also asked as:** "How does DNS resolution work inside a pod? And what exactly do you check when my-service.default.svc.cluster.local doesn't resolve?"
+
 Every pod gets `/etc/resolv.conf` injected automatically, pointing to CoreDNS (usually `10.96.0.10`). It has search domains like `default.svc.cluster.local`, so when you do `curl my-service`, K8s expands it to `my-service.default.svc.cluster.local` and resolves it via CoreDNS.
 
 **The thing most people miss — `ndots:5`.** If the hostname has fewer than 5 dots, K8s treats it as a relative name and appends search domains first. So even `api.stripe.com` (2 dots) triggers 4 extra DNS lookups before trying the actual domain. In a high-throughput service making 1000 requests/sec, that's 4000 unnecessary DNS queries/sec. We fixed this by adding a trailing dot (`api.stripe.com.`) which tells the resolver "this is absolute, don't append anything."
@@ -601,6 +603,8 @@ yq -i '.image.tag = "'$BUILD_NUMBER'"' apps/my-app/values-prod.yaml
 
 ## 16. EKS vs self-managed Kubernetes — when would you choose each?
 
+> **Also asked as:** "Difference between EKS & self-managed K8s"
+
 **EKS (or any managed K8s)** — 90% of the time, this is the right answer. AWS manages the control plane (API server, etcd, scheduler, controller-manager). You don't patch it, back it up, or worry about HA. Upgrades are a button click. You focus on workloads, not infrastructure.
 
 **Choose EKS when:**
@@ -686,6 +690,8 @@ kubectl get pod <pod-name> -o jsonpath='{.spec.tolerations}'
 ---
 
 ## 19. What are the pre-requisites to upgrade a Kubernetes cluster?
+
+> **Also asked as:** "What are pre-requisites to upgrade K8s cluster?"
 
 Upgrading K8s is not `apt upgrade`. It can break workloads, APIs, and integrations if you skip preparation. Here's the checklist I follow before every upgrade.
 
@@ -1916,3 +1922,17 @@ We use Istio service mesh in our clusters. Every application pod automatically g
 **Summary:**
 - **Init Container:** Prepares the environment, does its job, and dies before the app starts. (e.g., db migrations, waiting for dependencies, fetching secrets).
 - **Sidecar Container:** Runs forever next to the app, helping it out. (e.g., logging agents, service mesh proxies, local caching proxies).
+
+---
+
+## 32. What is Pgpool in Kubernetes?
+
+**Pgpool-II (often just called Pgpool)** is a middleware proxy that sits between your application and a PostgreSQL database. When running a highly available PostgreSQL cluster in Kubernetes, Pgpool is typically deployed alongside it (or even as a sidecar) to solve several architectural challenges.
+
+**What it does and why we use it:**
+
+1. **Connection Pooling:** PostgreSQL spawns a new process for every database connection, which is memory-intensive. If 50 API pods each open 20 connections, Postgres can easily exhaust its resources or hit connection limits. Pgpool intercepts these connections, maintaining a smaller pool of persistent connections to the database while multiplexing incoming connections from the app.
+2. **Load Balancing:** When running a PostgreSQL cluster with one Primary (Read/Write) and multiple Replicas (Read-Only), the application traditionally has to know which connection string to use for writes vs. reads. Pgpool can transparently parse the SQL queries, sending `SELECT` statements to the Replicas and `INSERT/UPDATE/DELETE` statements to the Primary.
+3. **High Availability and Failover:** If the Primary Postgres pod crashes, Pgpool can detect the failure, wait for a Replica to be promoted to Primary by the HA controller (like Patroni or Stolon), and seamlessly redirect traffic to the new Primary without the application needing to be reconfigured.
+
+*In K8s context:* Pgpool is often deployed as a Deployment itself with an associated Service. The application pods connect to the Pgpool Service, treating it as if it were a single, infinitely capable Postgres database, completely abstracted from the complexity of the underlying StatefulSet.

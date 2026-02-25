@@ -4,6 +4,8 @@
 
 ## 1. Explain the Terraform lifecycle, terraform refresh, and terraform import.
 
+> **Also asked as:** "What is Terraform import and when do we use it?"
+
 These three are often asked together because they're all about how Terraform manages the relationship between your code, your state file, and your actual infrastructure. Let me explain them the way I think about them in production.
 
 ---
@@ -767,3 +769,105 @@ git add .terraform.lock.hcl && git commit -m "upgrade aws provider to 5.35.0"
 ```
 
 **Real scenario:** Our team didn't commit the lock file. AWS provider released 5.20.0 which changed the behaviour of `aws_security_group` resource — existing rules were now treated as external and removed on next apply. One engineer's `terraform plan` showed no changes (they had 5.19.0 in cache), another's showed destruction of all security group rules (5.20.0). We committed the lock file immediately. Provider upgrades are now a deliberate PR with a plan review, not an accidental side effect of running `terraform init`.
+
+---
+
+## 9. How to switch between dev and prod in AWS CLI and terraform ?
+
+> **Also asked as:** "How to switch between dev and prod in AWS CLI and terraform ?"
+
+In a proper DevOps setup, `dev` and `prod` live in completely separate AWS Accounts to minimize the blast radius of a mistake. Switching between them involves routing both your local AWS CLI and Terraform to the correct account and state.
+
+**Step 1: Set up AWS CLI Profiles**
+In your `~/.aws/credentials` or `~/.aws/config` (if using SSO), you define profiles for each environment.
+```ini
+[profile dev]
+sso_account_id = 111111111111
+sso_role_name = DeveloperAccess
+
+[profile prod]
+sso_account_id = 999999999999
+sso_role_name = ReadOnlyAccess
+```
+
+To switch context in the terminal, export the profile variable:
+```bash
+export AWS_PROFILE=dev
+aws s3 ls # Lists Dev buckets
+export AWS_PROFILE=prod
+aws s3 ls # Lists Prod buckets
+```
+
+**Step 2: Tell Terraform which Profile to use**
+In your Terraform `providers.tf`, configure the AWS provider to respect the local environment variable, or hardcode the profile based on a variable.
+
+```hcl
+provider "aws" {
+  region  = "us-east-1"
+  # This tells Terraform to use the AWS_PROFILE you exported in the terminal
+}
+```
+
+**Step 3: Switch Terraform State (Workspaces vs Directories)**
+You cannot let Dev and Prod share the same Terraform state file. If they do, running `apply` in Prod might delete Dev resources.
+
+*Approach A: Workspaces (Good for identical environments)*
+Workspaces allow you to use the exact same directory of `.tf` files but maintain separate state files under the hood.
+```bash
+# Switch to Dev
+export AWS_PROFILE=dev
+terraform workspace select dev
+terraform apply -var-file="dev.tfvars"
+
+# Switch to Prod
+export AWS_PROFILE=prod
+terraform workspace select prod
+terraform apply -var-file="prod.tfvars"
+```
+
+*Approach B: Directory Separation (Enterprise Standard)*
+Most teams avoid Workspaces for environments because it relies on human memory: if you forget to run `workspace select prod` but pass `prod.tfvars`, you might destroy Dev. Instead, we use directory separation:
+```bash
+cd environments/dev
+export AWS_PROFILE=dev
+terraform init   # Configured perfectly for the Dev S3 bucket
+terraform apply
+
+cd ../prod
+export AWS_PROFILE=prod
+terraform init   # Configured perfectly for the Prod S3 bucket
+terraform apply
+```
+This physically separates the state configurations, making accidental cross-environment destruction nearly impossible.
+
+---
+
+## 9. One terraform command to detect drift
+
+> **Also asked as:** "One terraform command to detect drift"
+
+The most reliable, automated way to detect if your actual cloud infrastructure has drifted from your Terraform code is using the detailed exit codes flag on a plan:
+
+```bash
+terraform plan -detailed-exitcode
+```
+
+**What it does:**
+Normally, `terraform plan` returns an exit code of `0` regardless of whether the plan found changes or not. This makes it useless for simple CI/CD drift detection scripts unless you parse the text output.
+
+When you add `-detailed-exitcode`, Terraform changes its exit behavior:
+- **Exit Code 0:** Success, and the plan is empty. (Zero drift).
+- **Exit Code 1:** Error executing the plan (e.g., syntax error, AWS API failure).
+- **Exit Code 2:** Success, but the plan contains changes. (**Drift detected!**)
+
+**How to use it in practice:**
+Set up a cron job in your CI/CD platform to run nightly:
+
+```bash
+terraform plan -detailed-exitcode
+if [ $? -eq 2 ]; then
+  curl -X POST -H 'Content-type: application/json' \
+  --data '{"text":"🚨 Terraform Drift Detected in Production! Someone touched the console."}' \
+  <SLACK_WEBHOOK_URL>
+fi
+```

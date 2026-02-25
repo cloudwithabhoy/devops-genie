@@ -343,3 +343,61 @@ Falco: Runtime detection of policy violations (alert if violated)
 ```
 
 **Real scenario:** A developer unknowingly shipped a container running as root with `securityContext` not set (they copied a quickstart example). In production, this container had root access to the underlying node filesystem. After enabling Gatekeeper with the `K8sRequireNonRoot` constraint, that deployment was rejected at `kubectl apply` with a clear error message. The developer fixed the Dockerfile to use `USER 1000` and added `runAsNonRoot: true` to the pod spec. The policy caught 8 similar violations in existing deployments that were remediated over the next sprint.
+
+---
+
+## 3. Dockerfile: Best practices for Go app builds
+
+> **Also asked as:** "Dockerfile: Best practices for Go app builds"
+
+Go is a compiled language that produces statically linked binaries. This means the final Docker image doesn't need Go, bash, libc (usually), or any package managers. You can achieve incredibly tiny, highly secure images using multi-stage builds.
+
+**The Anti-Pattern (The 800MB Image):**
+```dockerfile
+FROM golang:1.21
+WORKDIR /app
+COPY . .
+RUN go build -o main .
+CMD ["./main"]
+```
+This ships the entire Go compiler, OS utilities, and source code to production. Huge attack surface, slow pulls.
+
+**The Best Practice (The 5MB Image):**
+
+```dockerfile
+# Stage 1: Build Environment
+FROM golang:1.21-alpine AS builder
+WORKDIR /app
+
+# Cache dependencies first (improves build speed on code changes)
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source and build
+COPY . .
+# CGO_ENABLED=0 ensures a fully static binary (no dependency on libc)
+# GOOS=linux GOARCH=amd64 ensures the target architecture is correct
+# -ldflags="-w -s" strips debugging information to reduce binary size
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o /app/main .
+
+# Stage 2: Production Run Environment
+# 'scratch' is an empty image (zero bytes). No shell, no OS, no vuln surface.
+# 'gcr.io/distroless/static' is an alternative if you need CA certs/timezone data.
+FROM scratch
+
+# Copy the compiled binary from the builder stage
+COPY --from=builder /app/main /main
+
+# (Optional) Copy CA certificates if your app makes outbound HTTPS calls
+# COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+
+# Run as non-root (Requires adding a user in the builder stage)
+# USER 1000:1000 
+
+ENTRYPOINT ["/main"]
+```
+
+**Why this is the standard:**
+1. **Security:** The `scratch` image has no shell. If an attacker finds an RCE vulnerability in your Go code, they cannot execute `sh` or `curl` or `wget` to download payloads because those binaries literally do not exist in the image.
+2. **Speed & Cost:** A 5MB image pulls across the network to a Kubernetes node instantly. Faster scaling, cheaper ECR storage.
+3. **Reproducibility:** Dependencies are locked (`go.sum`) and the build matrix is explicitly defined (`CGO_ENABLED=0`).

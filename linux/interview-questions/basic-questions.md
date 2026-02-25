@@ -691,6 +691,8 @@ find /var/log/myapp/ -name "*.log" -mtime +7 -delete
 
 ## 15. What is the command to check listening ports in Linux?
 
+> **Also asked as:** "One-liner to find open ports on a Linux node"
+
 ```bash
 # Option 1: ss (modern, preferred over netstat)
 ss -tlnp

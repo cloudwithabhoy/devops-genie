@@ -498,6 +498,8 @@ When the CI pipeline merges to main and updates `values-prod.yaml`, ArgoCD shows
 
 ## 6. How do you design a CI/CD pipeline for a secure deployment?
 
+> **Also asked as:** "How do you create a secure CI/CD pipeline?"
+
 A secure CI/CD pipeline isn't just "add a security scan." It's designing the pipeline so that insecure code, vulnerable dependencies, misconfigured infrastructure, and leaked secrets **cannot** reach production. Security is a gate at every stage, not an afterthought.
 
 **The pipeline stages with security at each gate:**

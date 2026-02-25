@@ -4,6 +4,8 @@
 
 ## 1. What is the difference between Declarative and Scripted Jenkins pipelines?
 
+> **Also asked as:** "Write a rough pipeline script for microservices architecture."
+
 Both are written in a Jenkinsfile, both live in source control alongside the code — the difference is structure, safety, and readability.
 
 **Declarative pipeline:**

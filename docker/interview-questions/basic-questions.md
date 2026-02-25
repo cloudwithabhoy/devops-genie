@@ -437,6 +437,8 @@ docker run -d -p 8080:80 -v /host/data:/container/data nginx:latest
 
 ## 8. What is the difference between CMD and ENTRYPOINT in a Dockerfile?
 
+> **Also asked as:** "What is the difference between CMD and ENTRYPOINT in Docker?"
+
 Both define what runs when a container starts — but they behave differently when arguments are passed to `docker run`.
 
 **CMD — default command, easily overridden.**

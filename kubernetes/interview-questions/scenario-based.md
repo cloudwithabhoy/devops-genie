@@ -6,6 +6,8 @@ Situational Kubernetes questions that test real-world problem-solving skills.
 
 ## 1. Post-deploy, latency spikes for 30% of users. No errors. No logs. What now?
 
+> **Also asked as:** "After a deployment, 30% of users report slow response times. No errors. No logs. No spikes in CPU/memory. How do you triage? Where do you even start?"
+
 First — 30% is suspicious. If you have 10 pods and 3 are slow, that's your 30%. So I start there.
 
 **Triage steps:**
@@ -29,6 +31,8 @@ First — 30% is suspicious. If you have 10 pods and 3 are slow, that's your 30%
 ---
 
 ## 2. Tell me about the last outage you debugged in Kubernetes.
+
+> **Also asked as:** "Tell me about the last Kubernetes outage you debugged. If you don't have a postmortem, you probably didn't lead the incident."
 
 **Incident:** Friday evening. Payment service — 100% of requests returning 503. All pods `Running` and `Ready` (1/1). Customer checkout was completely down. PagerDuty alert: "payment-service: 0% success rate."
 
@@ -956,5 +960,82 @@ spec:
 | Rate limiting | Protect pods during surge | Immediate |
 
 **Real scenario:** A product launch drove 10x normal traffic in 3 minutes. HPA was configured (CPU target 70%) but pods needed 90 seconds each to start (large image, slow readiness probe). By the time 8 new pods were ready, the original 4 pods had been throttled to the point of 30s response times. Fix applied for next launch: set `minReplicas: 15`, tuned HPA `scaleUp.stabilizationWindowSeconds: 0` and `Percent: 100` policy, pre-cached the image via DaemonSet, and pre-scaled to 30 replicas 10 minutes before the launch using a KEDA cron trigger. Next product launch: latency stayed flat throughout the traffic surge.
+
+---
+
+## 13. Your K8s app crashes during image pull — how to triage?
+
+> **Also asked as:** "Your K8s app crashes during image pull — how to triage?"
+
+This usually manifests as `ImagePullBackOff` or `ErrImagePull`. Triage is a process of elimination:
+
+**1. Is it a network issue or an auth issue?**
+Read the exact event: `kubectl describe pod <pod>`
+- `"failed to resolve reference... no basic auth credentials"` → Authentication issue.
+- `"failed to do request: Head https://... i/o timeout"` → Network issue.
+- `"manifest for image... not found"` → The tag literally doesn't exist in the registry (maybe a CI/CD build failure didn't actually push the image but updated the manifest anyway).
+
+**2. Triaging Auth Issues (Registry Credentials):**
+- Does the pod have an `imagePullSecrets` defined?
+- If pulling from ECR on AWS: Does the underlying Node IAM role have `ecr:GetDownloadUrlForLayer` and `ecr:BatchGetImage` permissions?
+- Is the ECR token expired? (Tokens expire after 12 hours).
+
+**3. Triaging Network Issues:**
+- Is the node in a private subnet? Can it reach the internet? (Check NAT Gateway logs).
+- **VPC Endpoints:** If you are using ECR VPC Endpoints (to save NAT Gateway costs), ensure the endpoint Security Group allows HTTPS (port 443) from the worker node security group.
+- **Node Disk Space:** Sometimes `ErrImagePull` isn't networking at all. The node might be out of disk space (`DiskPressure`) and the kubelet refuses to pull new huge image layers. Check `kubectl describe node`.
+
+---
+
+## 14. Cost exploded in staging due to HPA — RCA this
+
+> **Also asked as:** "Cost exploded in staging due to HPA — RCA this"
+
+Horizontal Pod Autoscaler (HPA) adding maximum replicas and racking up EC2/Karpenter costs is a classic symptom of a metric feedback loop.
+
+**How I root-cause it:**
+
+1. **Look at the HPA Events:**
+`kubectl describe hpa <name>`
+Why did it scale? Did it hit the CPU target? Memory target? A custom metric?
+
+2. **The Memory Leak Trap:**
+If the HPA scales on **Memory Utilization**, and the application has a memory leak, HPA will see high memory usage and add another pod. That pod will also leak memory, triggering *another* scale-up. Eventually, HPA maxes out at `maxReplicas`.
+**Fix:** Never autoscale on memory for Java/Node.js apps prone to leaks unless you have strict limits that trigger OOMKills *before* the HPA scales up.
+
+3. **The "Too Low" Target Trap:**
+If the CPU `targetAverageUtilization` is set to 20%, but the application idles at 25% just keeping background threads and health checks alive, the HPA will endlessly add pods trying to bring the average down to 20%, maxing out the cluster.
+**Fix:** Profile the idle consumption. Ensure HPA targets are realistically achievable above the baseline idle state.
+
+4. **Karpenter / Cluster Autoscaler Interaction:**
+The HPA added 50 pods. The Cluster Autoscaler / Karpenter saw 50 pending pods and provisioned new EC2 nodes to fit them. This is where the actual cost explosion happened. 
+**Fix:** Implement strict ResourceQuotas on the `staging` namespace to cap total CPU/Memory regardless of what the HPA demands. Set realistic `maxReplicas`.
+
+---
+
+## 15. Real war room: Service down, no alerts. Logs are green. What next?
+
+> **Also asked as:** "Real war room: Service down, no alerts. Logs are green. What next?"
+
+If the app says it's healthy, and monitoring says the pod is healthy, but the user says it's down, **the problem is in the routing pathway.**
+
+**1. Test from the inside out:**
+- Exec into another pod in the cluster: `curl http://broken-service:8080`.
+  - If it **works**: The issue is external (Ingress, ALB, DNS, WAF).
+  - If it **fails**: The issue is internal (NetworkPolicy, Service selector mismatch, kube-proxy iptables).
+
+**2. Check the Ingress Controller:**
+- Are there 502/503s in the `ingress-nginx-controller` logs?
+- Did the readiness probe fail without crashing the app? If the pod is `Running` but `0/1 Ready`, the Service removes the pod from its endpoints. The app logs look fine (it's not crashing), but the Ingress has no backends to route to. Check `kubectl get endpoints <service>`.
+
+**3. Check NetworkPolicies:**
+- Did someone apply a `default-deny` NetworkPolicy? The pods will hum along perfectly fine, logging zero errors (because no traffic is reaching them to cause an error), but all inbound connections drop silently at the Linux kernel level.
+
+**4. Check Cloud Infrastructure:**
+- Did a TLS certificate expire on the AWS ALB?
+- Is the Route 53 DNS record pointing to the wrong load balancer? (Usually happens after a manual infra recreation).
+- Did the ALB Security Group get changed, blocking port 443 from the internet?
+
+**Mindset:** Stop looking at the application code. Look at the `iptables`, the Load Balancer, and the DNS.
 
 ---
