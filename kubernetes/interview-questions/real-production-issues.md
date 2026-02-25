@@ -76,7 +76,7 @@ Don't guess. Follow the money systematically — compute, then storage, then net
 
 ## 4. A pod is continuously restarting and entering CrashLoopBackOff. How would you troubleshoot it?
 
-> **Also asked as:** "How do you debug a container crash?" · "Your container keeps crashing — what do you check?" · "Pod stuck in CrashLoopBackOff error — how will you troubleshoot?" · "A pod is stuck in CrashLoopBackOff. Logs show failure during initialization — how do you troubleshoot?"
+> **Also asked as:** "How do you debug a container crash?" · "Your container keeps crashing — what do you check?" · "Pod stuck in CrashLoopBackOff error — how will you troubleshoot?" · "A pod is stuck in CrashLoopBackOff. Logs show failure during initialization — how do you troubleshoot?" · "How do you troubleshoot a Pod stuck in CrashLoopBackOff?"
 
 CrashLoopBackOff means: container starts → crashes → K8s restarts it → crashes again → backoff delay increases (10s, 20s, 40s, up to 5 minutes). It's not an error itself — it's K8s telling you "I keep trying but this thing keeps dying."
 

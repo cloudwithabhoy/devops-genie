@@ -4,6 +4,8 @@
 
 ## 1. Write a shell script to alert when CPU utilisation reaches 80%.
 
+> **Also asked as:** "Write a script to alert when CPU utilization exceeds 80%"
+
 ```bash
 #!/bin/bash
 # cpu-alert.sh — checks CPU utilisation and sends an alert if above threshold

@@ -165,6 +165,8 @@ Check distributed traces for the actual response bodies from dependencies, or ad
 
 ## 3. Grafana dashboard is responding slowly — how do you troubleshoot it?
 
+> **Also asked as:** "Grafana dashboard is slow — how do you troubleshoot?"
+
 Slow Grafana dashboards have three possible root causes: expensive queries hitting Prometheus/datasource, Grafana's own resource constraints, or datasource performance degradation. You eliminate them in order.
 
 **Step 1: Identify which panel is slow using the browser.**

@@ -56,6 +56,8 @@ Leadership decided to go for a controlled release with:
 
 ## 2. Explain your roles and responsibilities.
 
+> Also asked as: "What are your roles and responsibilities in your current position?"
+
 Structure this around the three pillars of DevOps work: build/release, infrastructure, and reliability.
 
 "As a DevOps Engineer, my responsibilities span three main areas:
@@ -77,6 +79,8 @@ Structure this around the three pillars of DevOps work: build/release, infrastru
 
 ## 3. Explain about your current project.
 
+> Also asked as: "Can you explain your current project?"
+
 Frame it as: what the product does → tech stack → your specific contribution → challenges solved.
 
 "I'm working at [Company] on a B2B SaaS platform — it's a supply chain management product used by mid-sized manufacturers to track inventory, orders, and logistics.
@@ -95,6 +99,8 @@ My team (platform engineering — 3 engineers) is responsible for the shared inf
 ---
 
 ## 14. Explain the deployment strategy used in your organisation.
+
+> Also asked as: "What deployment strategies are used in your organization?"
 
 "In our organisation we use different strategies depending on the risk profile of the change.
 
@@ -155,4 +161,23 @@ I'm excited about this role because [reason specific to the company — their sc
 
 > **Also asked as:** "What is your role in your company?" — covered in Q2 above (roles and responsibilities structured around CI/CD, infrastructure, and reliability). "Explain about your current project" — covered in Q3 above.
 
+---
 
+## 5. What branching strategy does your team follow?
+
+"We follow a trunk-based development strategy with short-lived feature branches, optimized for fast CI/CD feedback. 
+
+**The Workflow:**
+- We have one primary branch: `main`. It always represents the deployable state of production.
+- When an engineer picks up a Jira ticket, they create a feature branch off `main` (e.g., `feature/JIRA-123-add-redis-caching`).
+- This feature branch is short-lived — ideally merged back within 1-2 days. 
+- We don't use long-running `develop` or `release` branches. What I found in previous projects is that long-living branches lead to massive merge conflicts and slow down the release cadence.
+
+**The Guardrails We Put in Place:**
+To make trunk-based development safe, we enforce several checks before a merge happens:
+1. **Pull Requests (PRs) are mandatory:** Direct pushes to `main` are blocked at the repository level.
+2. **Automated CI Validation:** When a PR is opened, Jenkins triggers a build, runs unit tests, and performs SonarQube static analysis. If any step fails, or if code coverage drops below 80%, the merge is blocked.
+3. **Approvals:** At least one senior peer review is required.
+
+**How We Handle Incomplete Features:**
+If a feature takes a week to build but we deploy `main` twice a day, we use **feature toggles (feature flags)**. The code is merged to `main` and deployed to production, but the feature remains wrapped in a toggle and is inactive for users until it's fully ready. This prevents code rot and keeps integrations continuous."

@@ -236,7 +236,7 @@ startupProbe:
 
 ## 8. Why are StatefulSets useful, and how do they differ from Deployments?
 
-> **Also asked as:** "What is a StatefulSet in Kubernetes?" · "Explain the difference between a Deployment and a StatefulSet" · "Kubernetes deployment vs StatefulSets"
+> **Also asked as:** "What is a StatefulSet in Kubernetes?" · "Explain the difference between a Deployment and a StatefulSet" · "Kubernetes deployment vs StatefulSets" · "Kubernetes Deployments vs StatefulSets – what’s the difference?"
 
 **Deployments** are for stateless apps — your API servers, frontends, workers. Every pod is identical and interchangeable. If pod-3 dies, a new pod is created with a random name (`app-7xk2f`) and can be scheduled anywhere. Pods don't have a fixed identity.
 
@@ -520,7 +520,7 @@ spec:
 
 ## 13. Explain Kubernetes cluster architecture
 
-> **Also asked as:** "What are the main components of Kubernetes?"
+> **Also asked as:** "What are the main components of Kubernetes?" · "Explain Kubernetes Architecture?"
 
 A K8s cluster has two parts: the **Control Plane** (brain) and **Worker Nodes** (muscle).
 
@@ -559,7 +559,7 @@ You run `kubectl apply -f deployment.yaml`:
 
 ## 14. What are the different Kubernetes deployment strategies?
 
-> **Also asked as:** "Explain the deployment strategy used in your organisation" · "How do you ensure zero-downtime deployments?" · "How would you ensure zero-downtime deployment during a critical update?"
+> **Also asked as:** "Explain the deployment strategy used in your organisation" · "How do you ensure zero-downtime deployments?" · "How would you ensure zero-downtime deployment during a critical update?" · "Deployment strategies in Kubernetes?"
 
 Four main strategies, each with different risk profiles:
 

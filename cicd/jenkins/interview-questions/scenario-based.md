@@ -42,6 +42,8 @@ node {
 
 ## 2. How do you deploy a new Jenkins instance with zero downtime?
 
+> Also asked as: "How do you perform a zero-downtime Jenkins deployment or upgrade?"
+
 The goal is to replace or upgrade Jenkins without any gap in the ability to run builds. The strategy depends on whether you're upgrading an existing Jenkins or migrating to a new one.
 
 **Approach 1: Blue/Green Jenkins deployment (new instance in parallel).**

@@ -346,6 +346,8 @@ With `.dockerignore` in place, `COPY . .` is safe and copies only the relevant a
 
 ## 7. What is the difference between a Docker image and a Docker container?
 
+> Also asked as: "What is the difference between Docker images and containers?"
+
 This is one of the most fundamental Docker concepts and is asked in almost every interview.
 
 **Docker Image — the blueprint (read-only template).**

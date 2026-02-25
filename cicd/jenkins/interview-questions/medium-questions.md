@@ -339,6 +339,8 @@ sh "docker build --build-arg DB_PASS=$DB_PASSWORD ."
 
 ## 5. What is the concept of Pipeline as Code in Jenkins?
 
+> Also asked as: "What is Pipeline as Code in Jenkins?"
+
 Pipeline as Code means the CI/CD pipeline definition is stored in a file (`Jenkinsfile`) inside the application's Git repository — not configured through the Jenkins UI. The pipeline travels with the code, is versioned, reviewed, and audited exactly like application code.
 
 **The problem Pipeline as Code solves:**
@@ -402,6 +404,8 @@ A **Multibranch Pipeline** job scans the Git repository for `Jenkinsfile` in eve
 ---
 
 ## 6. How do you implement a manual approval gate in a Jenkins pipeline?
+
+> Also asked as: "How do you manually trigger a Jenkins job when approval is required?"
 
 When a deployment needs a human to approve before proceeding — typically before pushing to production — you use the `input` step.
 
@@ -483,6 +487,8 @@ stage('Approval') {
 
 ## 7. What are agents in Jenkins and runners in GitHub Actions / GitLab CI?
 
+> Also asked as: "What are agents and runners in CI/CD?"
+
 All three CI/CD tools have the same concept — a machine that executes pipeline steps — but they use different terminology.
 
 **Jenkins Agents:**
@@ -557,6 +563,8 @@ build:
 ---
 
 ## 8. How do you create multi-stage jobs in Jenkins?
+
+> Also asked as: "How do you create multi-stage pipelines in Jenkins?"
 
 Multi-stage pipelines break a build into sequential or parallel stages — Build → Test → Security Scan → Push → Deploy. Each stage has a clear name, can fail independently, and the pipeline visualization shows exactly where a failure occurred.
 

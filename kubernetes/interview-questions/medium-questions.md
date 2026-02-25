@@ -742,6 +742,7 @@ This evicts pods respecting PDBs and graceful termination periods.
 ---
 
 ## 20. What monitoring tools do you use in Kubernetes? What alerts do you set up, and what are common pod management errors?
+> **Also asked as:** "What metrics do you monitor for continuous deployment?" · "How do you know if a deployment was successful?"
 
 **Tools — the observability stack:**
 
@@ -1879,3 +1880,39 @@ spec:
 **Real scenario:** A spot instance running 2 of our 3 API replicas was terminated by AWS (spot interruption — 2-minute warning). With default settings and no anti-affinity, both replicas had landed on the same node. When it died, 2 out of 3 pods were gone — 66% capacity lost, 502 errors for 4 minutes while pods rescheduled and warmed up. After adding `podAntiAffinity` with `topologyKey: kubernetes.io/hostname`, the 3 replicas spread across 3 different nodes. The next spot interruption killed 1 node — 1 pod was rescheduled, the other 2 continued serving traffic. Zero user impact.
 
 ---
+
+## 31. Difference between Sidecar container and Init Container(Explain with use cases)
+
+Both are patterns for running multiple containers in a single pod, but they have completely different lifecycles and purposes.
+
+**Init Container (Runs sequentially before the app starts)**
+- **Lifecycle:** Must run to completion (exit code 0) *before* the main app container starts.
+- **Sequential:** If you have multiple init containers, they run one after the other.
+- **Failure:** If it fails, the pod restarts (based on restartPolicy) and the main container never boots.
+- **Use case:** Setting up prerequisites that shouldn't be baked into the main image.
+
+**Real use case for Init Container:**
+We have a legacy Java application that requires a database schema to be fully migrated before it starts, otherwise it crashes with a missing table error. We use an init container running Flyway to run the database migrations. The main Java app container won't even start until the Flyway container finishes successfully.
+
+```yaml
+initContainers:
+  - name: db-migration
+    image: flyway/flyway
+    command: ["flyway", "migrate"]
+containers:
+  - name: java-app
+    image: my-app:v1
+```
+
+**Sidecar Container (Runs alongside the app)**
+- **Lifecycle:** Runs continuously *alongside* the main app container.
+- **Parallel:** Starts at the same time as the main container and lives as long as the pod lives.
+- **Failure:** If it crashes, Kubernetes restarts it independently of the main container.
+- **Use case:** Augmenting or extending the main container's functionality without changing its code.
+
+**Real use case for Sidecar Container:**
+We use Istio service mesh in our clusters. Every application pod automatically gets an Envoy proxy sidecar injected. The sidecar handles mTLS encryption, retries, and traffic routing to other services. The main application just makes plain HTTP calls to `localhost`, completely unaware that the Envoy sidecar is intercepting the traffic and encrypting it before sending it over the network.
+
+**Summary:**
+- **Init Container:** Prepares the environment, does its job, and dies before the app starts. (e.g., db migrations, waiting for dependencies, fetching secrets).
+- **Sidecar Container:** Runs forever next to the app, helping it out. (e.g., logging agents, service mesh proxies, local caching proxies).

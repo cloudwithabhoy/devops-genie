@@ -4,6 +4,8 @@
 
 ## 1. What is the difference between metrics, logs, and traces — and when do you start with each?
 
+> **Also asked as:** "Can you explain logs, metrics, and traces?"
+
 These are the three pillars of observability. Most people can define them; the real answer is knowing which one to reach for first in different scenarios.
 
 **Metrics — numbers over time.**
@@ -261,6 +263,8 @@ curl -X POST http://localhost:9093/api/v1/alerts \
 ---
 
 ## 3. How do you create a monitoring dashboard for your organisation?
+
+> **Also asked as:** "How do you create a monitoring dashboard?"
 
 Building a monitoring dashboard isn't just adding graphs — it's asking "what questions does each team need answered?" and structuring dashboards accordingly. A dashboard no one looks at is wasted effort.
 

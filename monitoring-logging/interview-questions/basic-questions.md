@@ -154,3 +154,51 @@ receivers:
 
 **Grafana Alerts** are good for alerting on data from multiple sources (a single alert combining Prometheus metrics + Loki logs + MySQL query). For pure Prometheus alerting, Alertmanager is more powerful and doesn't require Grafana to be running.
 
+---
+
+## 3. How do you configure CPU alerts in Prometheus?
+
+To configure CPU alerts, you need a precise PromQL expression and an alerting rule file.
+
+**Step 1: The PromQL expression**
+
+For host-level (EC2/VM) CPU usage using `node_exporter`, you calculate CPU usage by subtracting the `idle` time from 100%:
+```promql
+100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+```
+
+For Kubernetes pod limit utilization, you compare actual usage to the configured limit:
+```promql
+sum(rate(container_cpu_usage_seconds_total[5m])) by (pod) 
+  / 
+sum(kube_pod_container_resource_limits{resource="cpu"}) by (pod) * 100
+```
+
+**Step 2: Create the Alert Rule**
+
+Create an alerting rule definition in a YAML file (e.g., `cpu-alerts.yml`). The `for: 5m` prevents the alert from firing during short, normal CPU bursts.
+
+```yaml
+groups:
+  - name: cpu-alerts
+    rules:
+      - alert: HostHighCpuLoad
+        expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Host high CPU load (instance {{ $labels.instance }})"
+          description: "CPU load is > 80% for 5 minutes. Current value: {{ $value | printf \"%.2f\" }}%"
+```
+
+**Step 3: Load the rule in prometheus.yml**
+
+Tell Prometheus to evaluate this rule file:
+
+```yaml
+rule_files:
+  - "cpu-alerts.yml"
+```
+
+Finally, reload Prometheus configuration (`curl -X POST http://localhost:9090/-/reload`) and verify the alert appears under the "Alerts" tab in the Prometheus UI.
