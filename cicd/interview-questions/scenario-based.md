@@ -40,6 +40,30 @@ CD is handled by ArgoCD in a GitOps model. Jenkins never touches the cluster dir
 
 End to end — from a developer pushing code to users getting the update — this is the exact flow we ran in production.
 
+---
+
+## 3. How do you manage the security tools integrated in your pipeline?
+
+> **Also asked as:** "How do you manage them?" (following the security tools question)
+
+Managing security tools isn't just about adding a line to a Jenkinsfile. It requires a strategy for **onboarding**, **policy enforcement**, and **remediation**.
+
+**1. Centralized Configuration (Policy as Code):**
+We don't configure scan rules in individual pipelines. Instead, we use centralized configuration files (e.g., `sonar-project.properties` or `.trivyignore`) stored in a central repository or managed via UI (like SonarQube Quality Gates). This ensures every team follows the same security bar.
+
+**2. Quality Gates & Failure Thresholds:**
+We set "Quality Gates" in our CI/CD. If a SAST scan finds a **Critical** vulnerability or code coverage drops below 80%, the pipeline fails automatically. 
+*Rule:* You cannot merge to `main` until the security gate is green.
+
+**3. Suppression & Exception Handling:**
+If a vulnerability is found but is a false positive or has a mitigation (e.g., the service isn't exposed to the internet), we use a formal exception process. We add the CVE ID to an allowlist file with a justification and an expiration date.
+
+**4. Continuous Monitoring & Dashboarding:**
+We aggregate scan results into a central dashboard (like SonarQube or AWS Security Hub). This allows us to track "Security Debt" across all microservices and prioritize which teams need to focus on patching.
+
+**5. Secret Management:**
+For the tools itself (API keys for SonarQube/Snyk), we store them in **Jenkins Credentials** or **HashiCorp Vault**. They are injected into the pipeline at runtime and never printed to logs.
+
 **Step 1 — Developer pushes a feature branch and opens a PR.**
 
 GitHub webhook triggers a Jenkins pipeline immediately on the PR branch (not main), so we catch issues before merge.

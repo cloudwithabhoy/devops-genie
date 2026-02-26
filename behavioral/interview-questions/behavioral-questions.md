@@ -135,6 +135,8 @@ We use Argo Rollouts for canary deployments on critical services. 5% of traffic 
 
 ## 4. Tell me about yourself.
 
+> **Also asked as:** "Tell me about yourself."
+
 This is not a biography. It's a **90-second pitch** structured as: who you are → what you do → what makes you relevant to this role.
 
 **The framework: Present → Past → Future.**
@@ -144,6 +146,32 @@ Present:  What you're doing now (role, company, tech stack)
 Past:     Key experience that's relevant (1-2 highlights)
 Future:   Why you're here (what excites you about this role)
 ```
+
+---
+
+## 5. Walk me through your day-to-day activities as a DevOps Engineer.
+
+> **Also asked as:** "How your day to day activities as a DevOps Engineer."
+
+The interviewer wants to see if you are proactive or just a "ticket taker." A good answer shows a mix of automation, monitoring, and collaboration.
+
+**Morning: Health Check & Triage**
+- **Check Slack/Monitoring:** Review alerts from Prometheus/Grafana or PagerDuty. Did any 2 AM cron jobs fail? Did the production error rate spike?
+- **Pipeline Review:** Check for failed nightly builds or integration tests. If a build failed, communicate with the dev team to resolve blocks.
+
+**Mid-Day: Project Work (The "Engineering" part)**
+- **Infrastructure as Code (IaC):** Developing new Terraform modules or Ansible playbooks (e.g., migrating a service to a new AWS region or optimizing EKS node groups).
+- **CI/CD Optimization:** Improving pipeline speed (caching, parallel testing) or integrating a new security tool (SAST/DAST).
+- **Containerization:** Debugging Dockerfiles for the dev team or fine-tuning K8s resource limits.
+
+**Afternoon: Collaboration & Meetings**
+- **Stand-ups:** Sync with developers to understand upcoming infrastructure needs for new features.
+- **Root Cause Analysis (RCA):** If there was an issue, document the fix to prevent it from happening again.
+- **Code Reviews:** Reviewing PRs for IaC or Jenkinsfiles from other team members.
+
+**Wrap-up: Documentation & Training**
+- Updating the internal Wiki/Docs (e.g., recording the steps for a new deployment flow).
+- Mentoring junior devs on how to use the new logging platform.
 
 **Example (customize with your details):**
 

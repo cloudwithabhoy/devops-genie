@@ -83,7 +83,8 @@ If `agent none` is set at the pipeline level and a stage doesn't have its own `a
 
 ## 2. A Jenkins job works in Dev but fails in Production — how do you troubleshoot?
 
-> Also asked as: "A job works in Dev but fails in Production — how do you troubleshoot?"
+> **Also asked as:** "A job works in Dev but fails in Production — how do you troubleshoot?"
+> **Also asked as:** "How do you find errors in the pipelines?"
 
 The root cause of "works in dev, fails in prod" is almost always one of: environment variables, credentials, network access, resource limits, or a dependency that exists on the dev agent but not the prod agent.
 

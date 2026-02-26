@@ -4,6 +4,31 @@
 
 ## 1. You get paged at 2 AM — high latency alerts firing across multiple services. Walk me through your response.
 
+> **Also asked as:** "What monitoring tools are setup ? Have you set the alerts and tell me some common errors you faced related to pod management.."
+
+**Monitoring Stack:**
+In my project, we used the standard **Prometheus + Grafana** stack for metrics and **EFK (Elasticsearch, Fluentd, Kibana)** for logging.
+- **Prometheus:** Scrapes metrics from K8s nodes, cAdvisor, and application `/metrics` endpoints.
+- **Grafana:** Visualizes the data (Performance dashboards, Pod health, Cluster capacity).
+- **Alertmanager:** Sends alerts to Slack/PagerDuty based on Prometheus rules.
+
+**Alerts I've set up:**
+- **Connectivity:** Service error rate (5xx) > 1% for 5 minutes.
+- **Latency:** p99 Response time > 500ms for 2 minutes.
+- **Availability:** Pod restart count > 5 in 10 minutes (detects crashlooping).
+- **Capacity:** Node Disk/Memory usage > 85%.
+
+**Common Pod Management Errors I've faced:**
+1. **CrashLoopBackOff:** Pod starts, fails, and K8s tries to restart it repeatedly. Usually caused by missing environment variables, DB connection failure, or application bugs.
+2. **OOMKilled:** Pod exceeded its memory limit. Fix: Increase memory limit or optimize application memory usage.
+3. **ImagePullBackOff:** Incorrect image name, tag, or missing `imagePullSecrets` for private registries.
+4. **Pending State:** No node has enough resources (CPU/Memory) to schedule the pod. Fix: Add more nodes or reduce pod resource requests.
+5. **Terminating (Stuck):** Pod won't die because of finalizers or a process not handling SIGTERM. Fix: Force delete or debug the cleanup logic.
+
+---
+
+## 2. You get paged at 2 AM — high latency alerts firing across multiple services. Walk me through your response.
+
 **"Across multiple services" is the key phrase.** Single-service latency is usually a bug in that service. Multi-service latency simultaneously means shared infrastructure is failing — the database, the message queue, the network, or a dependency that everything calls.
 
 **First 2 minutes — narrow the blast radius, not the root cause.**

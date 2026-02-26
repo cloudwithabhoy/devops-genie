@@ -5,6 +5,7 @@
 ## 1. NAT Gateway vs VPC Peering — what's the difference?
 
 > **Also asked as:** "NAT Gateway vs VPC Peering"
+> **Also asked as:** "What are NAT gateway?"
 
 Both are AWS networking constructs used to route traffic from private subnets, but they solve two completely different problems: **Egress vs Internal Connectivity**.
 

@@ -2,7 +2,21 @@
 
 ---
 
-## 1. What is AWS CloudTrail and what are its use cases?
+## 1. What is the limit of number of objects you can store in an S3 bucket?
+
+> **Also asked as:** "How many objects can a S3 bucket can store?"
+
+There is **no limit** to the number of objects you can store in a single S3 bucket. You can store billions of objects.
+
+However, there are other limits to keep in mind:
+- **Individual Object Size:** Maximum 5 TB.
+- **Single PUT Operation:** Maximum 5 GB.
+- **Buckets per Account:** Default is 100 per AWS account (can be increased up to 1,000 via service quota request).
+- **Listing Performance:** While you can store billions of objects, listing them all in a single `ls` command becomes very slow. It is recommended to use prefixes (folders) to organize them.
+
+---
+
+## 2. What is AWS CloudTrail and what are its use cases?
 
 CloudTrail is AWS's audit logging service. Every API call made in your AWS account — through the console, CLI, SDK, or any AWS service — is recorded as an event in CloudTrail. It answers the question: **"Who did what, when, from where, and on which resource?"**
 

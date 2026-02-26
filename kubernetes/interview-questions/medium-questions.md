@@ -6,6 +6,32 @@ Intermediate-level Kubernetes interview questions and answers.
 
 ## 1. How does DNS resolution work inside a pod? And what do you check when a service isn't reachable by name?
 
+> **Also asked as:** "Pod Disruption Budget (PDB) in K8s"
+
+**Pod Disruption Budget (PDB)** is a policy that limits the number of pods of a replicated application that are down simultaneously from voluntary disruptions.
+
+**Key Use Cases:**
+- **Node Upgrades:** When you drain a node for maintenance/upgrades, PDB ensures that at least `X` amount of pods remain available.
+- **Cluster Autoscaling:** Prevents the autoscaler from killing too many pods at once.
+
+**Example YAML:**
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: my-app-pdb
+spec:
+  minAvailable: 2  # Or maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: my-app
+```
+*Note: PDBs only protect against **voluntary** disruptions (evictions). They do not protect against **involuntary** disruptions like hardware failure or a kernel panic on the VM.*
+
+---
+
+## 2. How does DNS resolution work inside a pod? And what do you check when a service isn't reachable by name?
+
 > **Also asked as:** "How does DNS resolution work inside a pod? And what exactly do you check when my-service.default.svc.cluster.local doesn't resolve?"
 
 Every pod gets `/etc/resolv.conf` injected automatically, pointing to CoreDNS (usually `10.96.0.10`). It has search domains like `default.svc.cluster.local`, so when you do `curl my-service`, K8s expands it to `my-service.default.svc.cluster.local` and resolves it via CoreDNS.

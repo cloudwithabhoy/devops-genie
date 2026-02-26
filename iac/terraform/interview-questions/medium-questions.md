@@ -4,6 +4,55 @@
 
 ## 1. Explain the Terraform lifecycle, terraform refresh, and terraform import.
 
+> **Also asked as:** "Write a terraform script for VPC architecture for production."
+
+For a production VPC, you shouldn't just create a VPC block. You need a multi-AZ setup with public and private subnets, NAT Gateways for egress, and proper tagging for EKS/ALB integration.
+
+**Production-grade VPC using Terraform:**
+
+```hcl
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~> 5.0"
+
+  name = "prod-vpc"
+  cidr = "10.0.0.0/16"
+
+  # Spread across 3 AZs for High Availability
+  azs             = ["ap-south-1a", "ap-south-1b", "ap-south-1c"]
+  
+  # Private subnets for Apps/DBs (No direct internet access)
+  private_subnets = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
+  
+  # Public subnets for LBs/NAT Gateways
+  public_subnets  = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"]
+
+  # Enable NAT Gateway for private instances to reach the internet (updates/patches)
+  enable_nat_gateway = true
+  single_nat_gateway = false  # One per AZ for redundancy
+  one_nat_gateway_per_az = true
+
+  enable_vpn_gateway = false
+
+  # Required for EKS / ALB integration
+  public_subnet_tags = {
+    "kubernetes.io/role/elb" = "1"
+  }
+  private_subnet_tags = {
+    "kubernetes.io/role/internal-elb" = "1"
+  }
+
+  tags = {
+    Environment = "production"
+    Owner       = "devops-team"
+  }
+}
+```
+
+---
+
+## 2. Explain the Terraform lifecycle, terraform refresh, and terraform import.
+
 > **Also asked as:** "What is Terraform import and when do we use it?"
 
 These three are often asked together because they're all about how Terraform manages the relationship between your code, your state file, and your actual infrastructure. Let me explain them the way I think about them in production.

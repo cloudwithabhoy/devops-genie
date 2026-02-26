@@ -6,6 +6,30 @@ Advanced-level Kubernetes interview questions and answers.
 
 ## 1. Walk me through what the controller manager does during a Deployment. No rollout status — reconciliation logic.
 
+> **Also asked as:** "How do we make a K8s cluster highly available?"
+
+High Availability (HA) in Kubernetes means ensuring that there is no single point of failure in the cluster. This is achieved at three levels:
+
+**1. Control Plane HA:**
+- **Kube-APIServer:** Run multiple replicas (usually 3) behind a Load Balancer. Since it's stateless, any node can handle requests.
+- **etcd:** Run an odd number of nodes (3, 5, or 7) in a cluster to maintain quorum. This is the source of truth for all cluster data.
+- **Kube-Scheduler & Kube-Controller-Manager:** Run multiple replicas with **Leader Election** enabled. Only one is active at a time, but if it fails, another takes over instantly.
+
+**2. Worker Node HA:**
+- Spread worker nodes across multiple **Availability Zones (AZs)**.
+- Use **Autoscaling (CAS or Karpenter)** to automatically replace failed nodes.
+
+**3. Infrastructure & Network HA:**
+- Use a **Multi-AZ Load Balancer** (like AWS ALB/NLB) for the API server and application ingress.
+- Use persistent storage that is replicated across zones (like EBS with multi-AZ or EFS).
+
+**Summary Answer:** 
+"In our production cluster, we use a managed service (EKS) which handles Control Plane HA across 3 AZs automatically. For our worker nodes, we use ASGs spread across 3 AZs and use Pod Anti-Affinity to ensure that replicas of the same application are never scheduled on the same node or in the same zone."
+
+---
+
+## 2. Walk me through what the controller manager does during a Deployment. No rollout status — reconciliation logic.
+
 > **Also asked as:** "What does the Kubernetes controller manager do during a Deployment? Not kubectl rollout status. Tell me about reconciliation, desired vs actual state, informers, and watch loops."
 
 Three controllers work in a chain: **Deployment Controller → ReplicaSet Controller → Scheduler + Kubelet**. Each runs an independent reconciliation loop — compare desired vs actual, take action on the diff.
