@@ -828,3 +828,110 @@ kubectl logs -n monitoring alertmanager-kube-prometheus-stack-alertmanager-0
 ```
 
 **Real scenario:** We had Prometheus alerts firing but nobody being notified — the alerts were in Prometheus UI but engineers only saw them during weekly reviews. After setting up the Alertmanager → Slack pipeline: the first week, 12 alerts fired that the team had never seen before. 3 were noise (tuned away). 9 were real issues: 2 memory leaks, 1 disk filling on a logging node, 4 intermittent connection pool exhaustions, 2 pods with high restart counts. All resolved within hours of being alerted — instead of discovered days later during user escalations. Mean Time To Detect (MTTD) dropped from 4 hours to 8 minutes.
+
+---
+
+## 6. What monitoring tools are set up in your project? Have you configured alerts and what common pod errors have you faced?
+
+> **Also asked as:** "Walk me through your observability stack" · "What tools do you use for monitoring K8s?" · "Tell me about alerts you've set and pod issues you've faced in production."
+
+This is a "show your real experience" question — they want specifics, not a list of tool names.
+
+**Our monitoring stack:**
+
+```
+Metrics:  Prometheus + kube-state-metrics + node-exporter
+Dashboards: Grafana (K8s dashboards, app-level dashboards)
+Alerting: Alertmanager → PagerDuty (P1/P2) + Slack (P3/P4)
+Logs:     Fluent Bit → Elasticsearch → Kibana (EFK stack)
+Tracing:  Jaeger (distributed tracing for microservices)
+Uptime:   Blackbox Exporter (external endpoint health checks)
+```
+
+All deployed via the `kube-prometheus-stack` Helm chart — one install gives you Prometheus, Alertmanager, Grafana, node-exporter, and kube-state-metrics pre-wired together.
+
+**Alerts we have configured:**
+
+```yaml
+# Critical alerts (PagerDuty — wake someone up)
+- alert: PodCrashLooping
+  expr: rate(kube_pod_container_status_restarts_total[15m]) > 0
+  for: 5m
+  labels:
+    severity: critical
+  annotations:
+    summary: "Pod {{ $labels.pod }} is crash looping"
+
+- alert: NodeNotReady
+  expr: kube_node_status_condition{condition="Ready",status="true"} == 0
+  for: 2m
+  labels:
+    severity: critical
+
+- alert: DeploymentReplicasMismatch
+  expr: kube_deployment_spec_replicas != kube_deployment_status_available_replicas
+  for: 10m
+  labels:
+    severity: warning
+  annotations:
+    summary: "{{ $labels.deployment }} has {{ $value }} fewer replicas than desired"
+
+# Warning alerts (Slack — investigate during business hours)
+- alert: PodHighMemory
+  expr: |
+    container_memory_working_set_bytes{container!=""}
+    / container_spec_memory_limit_bytes{container!=""}
+    > 0.85
+  for: 10m
+  labels:
+    severity: warning
+  annotations:
+    summary: "Pod {{ $labels.pod }} memory > 85% of limit — OOMKill risk"
+
+- alert: NodeDiskPressure
+  expr: |
+    (node_filesystem_size_bytes - node_filesystem_avail_bytes)
+    / node_filesystem_size_bytes > 0.80
+  for: 5m
+  labels:
+    severity: warning
+
+- alert: HighErrorRate
+  expr: |
+    rate(http_requests_total{status=~"5.."}[5m])
+    / rate(http_requests_total[5m]) > 0.05
+  for: 3m
+  labels:
+    severity: critical
+  annotations:
+    summary: "Error rate > 5% on {{ $labels.service }}"
+```
+
+**Common pod errors we've faced in production:**
+
+**1. CrashLoopBackOff:**
+Most common cause in our environment: missing environment variables. A secret or ConfigMap got renamed, the pod started with `nil` values, and the app panicked on startup.
+```bash
+kubectl logs <pod> --previous   # Check crash reason
+kubectl describe pod <pod>      # Check Events for missing secret/configmap
+```
+
+**2. OOMKilled:**
+Our Java service got OOMKilled every Monday morning — the JVM wasn't respecting container memory limits (pre-Java 11 behavior). Added `-XX:MaxRAMPercentage=75 -XX:+UseContainerSupport` to JVM flags. Solved it permanently.
+
+**3. ImagePullBackOff:**
+ECR tokens expire every 12 hours. After a node came up fresh overnight, it couldn't pull images because the ECR credential helper hadn't refreshed. Fix: switched to the `amazon-ecr-credential-helper` DaemonSet which auto-refreshes tokens.
+
+**4. Pods stuck in Pending:**
+After a team pushed a new service with `requests.memory: 4Gi` copy-pasted from a heavy batch job, all pods sat Pending for 20 minutes. No node had 4Gi free. Alert: `kube_pod_status_phase{phase="Pending"} > 0` for 5 minutes triggered in Slack.
+
+**5. Readiness probe failing → 503 on service:**
+A deployment changed the health endpoint from `/health` to `/healthz` but forgot to update the readiness probe. Pods were Running but NotReady — service had 0 endpoints. Grafana showed error rate spike; Kibana logs showed the probe hitting `/health` → 404. Rollback + fix in 8 minutes.
+
+**How we use Grafana dashboards:**
+- **K8s cluster overview** (USE method: Utilization, Saturation, Errors per node)
+- **Per-namespace resource consumption** (which team is consuming what)
+- **Application-level dashboards** (request rate, P95 latency, error rate — RED method)
+- **Business metrics dashboard** (orders per minute, payment success rate — pulled from app metrics via Prometheus custom metrics)
+
+**One thing I'd do differently:** We set up Jaeger tracing 6 months after the project started. If I'd done it from day one, several "mystery slowdowns" that took hours to debug would have been found in minutes. Distributed tracing is not optional for microservices.

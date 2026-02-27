@@ -920,3 +920,314 @@ if [ $? -eq 2 ]; then
   <SLACK_WEBHOOK_URL>
 fi
 ```
+
+---
+
+## 10. Write a Terraform script for a production VPC architecture.
+
+> **Also asked as:** "Write Terraform code for a 3-tier VPC" · "How do you provision a production-grade VPC with Terraform?" · "Give me a rough Terraform script for VPC architecture for production."
+
+A production VPC needs: multi-AZ, public/private/DB subnet tiers, NAT Gateways per AZ, Internet Gateway, Flow Logs, and Security Groups. Here's a complete, annotated script.
+
+```hcl
+# versions.tf
+terraform {
+  required_version = ">= 1.5"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+  backend "s3" {
+    bucket         = "my-tf-state"
+    key            = "prod/vpc/terraform.tfstate"
+    region         = "ap-south-1"
+    dynamodb_table = "terraform-state-lock"
+    encrypt        = true
+  }
+}
+
+provider "aws" {
+  region = var.region
+}
+```
+
+```hcl
+# variables.tf
+variable "region"      { default = "ap-south-1" }
+variable "env"         { default = "production" }
+variable "vpc_cidr"    { default = "10.0.0.0/16" }
+
+variable "azs" {
+  default = ["ap-south-1a", "ap-south-1b", "ap-south-1c"]
+}
+
+variable "public_subnets" {
+  default = ["10.0.0.0/20", "10.0.16.0/20", "10.0.32.0/20"]
+}
+
+variable "private_subnets" {
+  default = ["10.0.48.0/20", "10.0.64.0/20", "10.0.80.0/20"]
+}
+
+variable "db_subnets" {
+  default = ["10.0.96.0/20", "10.0.112.0/20", "10.0.128.0/20"]
+}
+```
+
+```hcl
+# vpc.tf
+
+# VPC
+resource "aws_vpc" "main" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_support   = true
+  enable_dns_hostnames = true   # Required for EKS, RDS endpoint resolution
+
+  tags = {
+    Name        = "${var.env}-vpc"
+    Environment = var.env
+  }
+}
+
+# Internet Gateway — one per VPC
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
+  tags   = { Name = "${var.env}-igw" }
+}
+
+# Public Subnets — one per AZ
+resource "aws_subnet" "public" {
+  count             = length(var.azs)
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = var.public_subnets[count.index]
+  availability_zone = var.azs[count.index]
+
+  # Instances in public subnets get a public IP automatically
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name = "${var.env}-public-${var.azs[count.index]}"
+    # Required tags for EKS to auto-discover subnets for ALB
+    "kubernetes.io/role/elb"             = "1"
+    "kubernetes.io/cluster/prod-cluster" = "shared"
+  }
+}
+
+# Private App Subnets — one per AZ
+resource "aws_subnet" "private" {
+  count             = length(var.azs)
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = var.private_subnets[count.index]
+  availability_zone = var.azs[count.index]
+
+  tags = {
+    Name = "${var.env}-private-${var.azs[count.index]}"
+    # Required for EKS internal load balancers
+    "kubernetes.io/role/internal-elb"    = "1"
+    "kubernetes.io/cluster/prod-cluster" = "shared"
+  }
+}
+
+# DB Subnets — isolated, no internet route
+resource "aws_subnet" "db" {
+  count             = length(var.azs)
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = var.db_subnets[count.index]
+  availability_zone = var.azs[count.index]
+
+  tags = {
+    Name = "${var.env}-db-${var.azs[count.index]}"
+  }
+}
+
+# Elastic IPs for NAT Gateways — one per AZ
+resource "aws_eip" "nat" {
+  count  = length(var.azs)
+  domain = "vpc"
+  tags   = { Name = "${var.env}-nat-eip-${count.index + 1}" }
+}
+
+# NAT Gateways — one per AZ in public subnet
+resource "aws_nat_gateway" "main" {
+  count         = length(var.azs)
+  allocation_id = aws_eip.nat[count.index].id
+  subnet_id     = aws_subnet.public[count.index].id
+
+  tags = { Name = "${var.env}-nat-${var.azs[count.index]}" }
+
+  depends_on = [aws_internet_gateway.main]
+}
+```
+
+```hcl
+# route_tables.tf
+
+# Public route table — routes to IGW
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.main.id
+  }
+
+  tags = { Name = "${var.env}-public-rt" }
+}
+
+resource "aws_route_table_association" "public" {
+  count          = length(var.azs)
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public.id
+}
+
+# Private route tables — one per AZ, routes to AZ-local NAT GW
+resource "aws_route_table" "private" {
+  count  = length(var.azs)
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.main[count.index].id
+  }
+
+  tags = { Name = "${var.env}-private-rt-${var.azs[count.index]}" }
+}
+
+resource "aws_route_table_association" "private" {
+  count          = length(var.azs)
+  subnet_id      = aws_subnet.private[count.index].id
+  route_table_id = aws_route_table.private[count.index].id
+}
+
+# DB subnets — no internet route (isolated)
+resource "aws_route_table" "db" {
+  vpc_id = aws_vpc.main.id
+  tags   = { Name = "${var.env}-db-rt" }
+  # No route to 0.0.0.0/0 — DB subnets cannot reach internet
+}
+
+resource "aws_route_table_association" "db" {
+  count          = length(var.azs)
+  subnet_id      = aws_subnet.db[count.index].id
+  route_table_id = aws_route_table.db.id
+}
+```
+
+```hcl
+# security_groups.tf
+
+# ALB Security Group — internet-facing
+resource "aws_security_group" "alb" {
+  name   = "${var.env}-alb-sg"
+  vpc_id = aws_vpc.main.id
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = { Name = "${var.env}-alb-sg" }
+}
+
+# App Security Group — only accepts traffic from ALB
+resource "aws_security_group" "app" {
+  name   = "${var.env}-app-sg"
+  vpc_id = aws_vpc.main.id
+
+  ingress {
+    from_port       = 8080
+    to_port         = 8080
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]   # ALB SG only
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = { Name = "${var.env}-app-sg" }
+}
+
+# DB Security Group — only accepts traffic from app tier
+resource "aws_security_group" "db" {
+  name   = "${var.env}-db-sg"
+  vpc_id = aws_vpc.main.id
+
+  ingress {
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.app.id]   # App SG only
+  }
+
+  tags = { Name = "${var.env}-db-sg" }
+}
+```
+
+```hcl
+# flow_logs.tf — VPC traffic visibility
+
+resource "aws_s3_bucket" "flow_logs" {
+  bucket        = "${var.env}-vpc-flow-logs-${data.aws_caller_identity.current.account_id}"
+  force_destroy = false
+}
+
+resource "aws_flow_log" "main" {
+  vpc_id               = aws_vpc.main.id
+  traffic_type         = "ALL"   # ACCEPT + REJECT
+  log_destination_type = "s3"
+  log_destination      = aws_s3_bucket.flow_logs.arn
+
+  tags = { Name = "${var.env}-vpc-flow-log" }
+}
+
+data "aws_caller_identity" "current" {}
+```
+
+```hcl
+# outputs.tf
+output "vpc_id"              { value = aws_vpc.main.id }
+output "public_subnet_ids"   { value = aws_subnet.public[*].id }
+output "private_subnet_ids"  { value = aws_subnet.private[*].id }
+output "db_subnet_ids"       { value = aws_subnet.db[*].id }
+output "alb_sg_id"           { value = aws_security_group.alb.id }
+output "app_sg_id"           { value = aws_security_group.app.id }
+output "db_sg_id"            { value = aws_security_group.db.id }
+```
+
+**Production checklist for this VPC setup:**
+
+```
+✅ Multi-AZ: 3 AZs, 9 subnets total
+✅ NAT Gateway per AZ: no cross-AZ dependency
+✅ DB subnets isolated: no internet route
+✅ SG chain: ALB → App → DB (no direct DB access from internet)
+✅ Flow Logs: ALL traffic to S3 for audit/debugging
+✅ DNS enabled: required for EKS, RDS, and service discovery
+✅ EKS subnet tags: ALB controller can auto-discover subnets
+✅ Remote state: S3 + DynamoDB locking
+✅ Separate route table per AZ for private subnets: AZ-local NAT routing
+```
+
+**Real tip for interviews:** Walk through the `depends_on = [aws_internet_gateway.main]` on the NAT Gateway. Interviewers love seeing you understand why — the NAT Gateway lives in a public subnet, and that subnet's route to the internet goes through the IGW. If the IGW doesn't exist yet, the NAT Gateway can't function even after creation. The explicit `depends_on` makes Terraform wait for the IGW to be attached before creating the NAT Gateways.
