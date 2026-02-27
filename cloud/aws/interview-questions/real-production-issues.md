@@ -730,3 +730,169 @@ resource "aws_s3_bucket_public_access_block" "backups" {
 ```
 
 **Real scenario:** A developer ran `aws s3 rm s3://prod-backups/ --recursive` thinking it was a test bucket — the bucket name was similar to a test bucket used earlier that day. 2,400 backup objects deleted. We had versioning enabled with no Object Lock. Recovery: listed all delete markers, removed them in a bulk loop script. All 2,400 objects restored in 8 minutes. Post-incident: added Object Lock COMPLIANCE mode with 30-day retention and cross-region replication. The next deletion attempt failed with: "Object is WORM protected and cannot be deleted."
+
+---
+
+## 6. IAM permission denied in production — how do you trace it without guessing?
+
+> **Also asked as:** "A Lambda/EC2/pod gets AccessDenied — how do you find the exact missing permission?" · "IAM policy debugging in AWS — what's your process?" · "Service returns 403 from AWS API — how do you fix it?" · "How do you troubleshoot IAM permission issues in EKS?"
+
+IAM `AccessDenied` errors are frustrating because the message tells you what was denied — not what was missing. The key is to go from the error message to the exact permission, the exact resource, and the exact identity.
+
+**Step 1: Read the error message precisely.**
+
+Every AWS `AccessDenied` error contains the exact context you need:
+
+```
+An error occurred (AccessDenied) when calling the PutObject operation:
+User: arn:aws:sts::123456789:assumed-role/my-app-role/i-0abc123def456
+is not authorized to perform: s3:PutObject
+on resource: arn:aws:s3:::prod-uploads/2024/invoices/invoice-001.pdf
+```
+
+From this one line you have:
+- **Who**: `my-app-role` (an EC2/EKS instance role)
+- **What action**: `s3:PutObject`
+- **On what resource**: `arn:aws:s3:::prod-uploads/2024/invoices/invoice-001.pdf`
+
+**Step 2: Find the identity and its attached policies.**
+
+```bash
+# Who is the calling identity?
+aws sts get-caller-identity
+# {
+#   "UserId": "AROAEXAMPLE:i-0abc123def456",
+#   "Account": "123456789",
+#   "Arn": "arn:aws:sts::123456789:assumed-role/my-app-role/i-0abc123def456"
+# }
+
+# What policies are attached to this role?
+aws iam list-attached-role-policies --role-name my-app-role
+aws iam list-role-policies --role-name my-app-role   # Inline policies
+
+# Read the policy document
+aws iam get-role-policy --role-name my-app-role --policy-name my-inline-policy
+# or for managed:
+aws iam get-policy-version \
+  --policy-arn arn:aws:iam::123456789:policy/my-app-policy \
+  --version-id v3   # Get the active version ID first
+```
+
+**Step 3: Use IAM Policy Simulator — the fastest way to debug.**
+
+```bash
+# Simulate the exact denied action without actually making the API call
+aws iam simulate-principal-policy \
+  --policy-source-arn arn:aws:iam::123456789:role/my-app-role \
+  --action-names s3:PutObject \
+  --resource-arns arn:aws:s3:::prod-uploads/2024/invoices/invoice-001.pdf
+
+# Response:
+# {
+#   "EvaluationResults": [{
+#     "EvalActionName": "s3:PutObject",
+#     "EvalResourceName": "arn:aws:s3:::prod-uploads/*",
+#     "EvalDecision": "explicitDeny",      ← denied by an explicit Deny statement
+#     "MatchedStatements": [{
+#       "SourcePolicyId": "prod-s3-restriction",
+#       "StartPosition": {"Line": 15},
+#       "EndPosition": {"Line": 22}
+#     }]
+#   }]
+# }
+# EvalDecision values: "allowed", "implicitDeny", "explicitDeny"
+# explicitDeny → a Deny statement somewhere is blocking it (SCP, resource policy, boundary)
+# implicitDeny → no Allow statement found
+```
+
+**Step 4: Check all the layers where IAM decisions happen.**
+
+IAM is an intersection — `ALLOW` only if every layer permits it:
+
+```
+1. SCP (Service Control Policy) — org-level ceiling
+2. Permission Boundary — role-level ceiling
+3. Identity Policy — what the role is allowed to do
+4. Resource Policy — what the resource allows (S3 bucket policy, KMS key policy)
+5. VPC Endpoint Policy — if accessing AWS services through a VPC endpoint
+6. Session Policy — if assuming a role with additional restrictions
+```
+
+```bash
+# Check if there's an SCP blocking it (requires Org access)
+aws organizations list-policies-for-target \
+  --target-id <account-id> \
+  --filter SERVICE_CONTROL_POLICY
+
+# Check S3 bucket policy (resource-level control)
+aws s3api get-bucket-policy --bucket prod-uploads
+# Look for explicit Deny statements
+
+# Check if there's a permission boundary on the role
+aws iam get-role --role-name my-app-role \
+  --query 'Role.PermissionsBoundary'
+# If set, the role can never exceed what the boundary allows — even if the policy allows more
+```
+
+**Step 5: EKS-specific — IRSA (IAM Roles for Service Accounts) issues.**
+
+In EKS, pods use IRSA to get AWS permissions. The most common source of `AccessDenied` in EKS:
+
+```bash
+# 1. Check if the pod has an IAM role annotation
+kubectl describe pod <pod> -n <namespace> | grep -i "iam\|role\|service-account"
+
+# 2. Check the service account annotation
+kubectl describe serviceaccount <sa-name> -n <namespace>
+# Annotations:
+#   eks.amazonaws.com/role-arn: arn:aws:iam::123456789:role/my-eks-pod-role
+# If this annotation is missing → pod uses node instance role, not the expected role
+
+# 3. Check the IAM role's trust policy — it must trust the OIDC provider
+aws iam get-role --role-name my-eks-pod-role \
+  --query 'Role.AssumeRolePolicyDocument'
+# Should include:
+# {
+#   "Effect": "Allow",
+#   "Principal": {
+#     "Federated": "arn:aws:iam::123456789:oidc-provider/oidc.eks.ap-south-1.amazonaws.com/id/EXAMPLED539D4633E53DE1B71EXAMPLE"
+#   },
+#   "Action": "sts:AssumeRoleWithWebIdentity",
+#   "Condition": {
+#     "StringEquals": {
+#       "oidc.eks.ap-south-1.amazonaws.com/id/EXAMPLED539D4633E53DE1B71EXAMPLE:sub":
+#         "system:serviceaccount:my-namespace:my-service-account"
+#     }
+#   }
+# }
+# If namespace or service account name is wrong in the Condition → AssumeRole fails → AccessDenied
+```
+
+**Step 6: Use CloudTrail to find exactly what was denied.**
+
+If the error is intermittent or happened in the past:
+
+```bash
+aws cloudtrail lookup-events \
+  --lookup-attributes AttributeKey=EventName,AttributeValue=PutObject \
+  --start-time 2024-01-15T10:00:00 \
+  --end-time 2024-01-15T11:00:00 \
+  --query 'Events[?contains(CloudTrailEvent, `AccessDenied`)]'
+
+# Or use CloudTrail Insights / Athena for high-volume queries
+# The CloudTrail event includes the exact ARN, action, resource, and error code
+```
+
+**Quick fix patterns:**
+
+| Error | Cause | Fix |
+|---|---|---|
+| `implicitDeny` on S3 | Policy allows `s3:Put*` but resource ARN is wrong | Add correct ARN: `arn:aws:s3:::bucket-name/*` for objects |
+| `explicitDeny` from SCP | Org policy blocks the action | Contact Org admin — can't override SCPs |
+| EKS pod gets node role instead of pod role | Missing IRSA annotation on ServiceAccount | Add `eks.amazonaws.com/role-arn` annotation |
+| Lambda `AccessDenied` on KMS | Lambda role doesn't have `kms:Decrypt` | Add KMS key policy + Lambda role policy |
+| Cross-account S3 access denied | Bucket policy doesn't list the source account | Add source account principal to bucket policy |
+
+**Real scenario:** Our EKS pod couldn't write to an S3 bucket — `AccessDenied` on `s3:PutObject`. The pod had an IRSA role attached, and the IAM policy allowed `s3:PutObject` on `arn:aws:s3:::prod-uploads/*`. IAM Policy Simulator showed `allowed`. But it was still failing. The culprit: the S3 bucket had a resource-based policy with an explicit `Deny` for principals outside the account — and our pod was sending requests through a VPC endpoint that was applying a restrictive endpoint policy. The request flow was: Pod → VPC Endpoint (with `Deny` unless specific condition) → S3. The identity policy said "allowed", but the endpoint policy had a narrower allow list. Fix: added the pod's IAM role ARN to the VPC endpoint policy's allow list. Took 3 hours to find because IAM Simulator doesn't simulate VPC endpoint policies.
+
+---
