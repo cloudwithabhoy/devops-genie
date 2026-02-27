@@ -947,3 +947,60 @@ Both are managed load balancers in AWS, but they operate at different layers of 
 
 **Summary:** 
 If you need routing rules based on `/api` vs `/web` or need to attach AWS WAF, use an **ALB**. If you need ultra-low latency, handling of raw TCP/UDP, or a static IP, use an **NLB**.
+
+---
+
+## 16. What is a NAT Gateway?
+
+> **Also asked as:** "What are NAT gateways?" · "Why do we use a NAT Gateway in a VPC?"
+
+A **NAT Gateway** (Network Address Translation Gateway) lets resources in a **private subnet** initiate outbound internet traffic — like pulling a Docker image, calling an external API, or downloading OS patches — without those resources being reachable from the internet.
+
+**The core problem it solves:**
+
+Private subnet resources (EC2 instances, EKS worker nodes, RDS) have no public IP. Without a NAT Gateway, they can't reach the internet at all — not even for `apt-get update`. With a NAT Gateway, they can initiate outbound connections, but inbound connections from the internet are still blocked.
+
+```
+Private Subnet                  NAT Gateway (Public Subnet)         Internet
+EC2 (10.0.2.10) ──────────────► NAT GW (Elastic IP: 3.4.5.6) ────► google.com
+                 Returns traffic via NAT GW ◄──────────────────────
+The EC2's private IP is never exposed to the internet.
+```
+
+**Key properties:**
+
+| Property | Detail |
+|---|---|
+| Direction | Outbound only — internet cannot initiate connections to private resources |
+| Placement | Lives in a **public subnet** (needs internet access itself) |
+| IP | Assigned an **Elastic IP** (static public IP) |
+| Managed | Fully managed by AWS — no patching, no HA config needed |
+| Availability | Deploy one per AZ for HA (single NAT GW = single point of failure) |
+| Cost | ~$0.045/hr + $0.045/GB data processed |
+
+**NAT Gateway vs Internet Gateway:**
+
+| | Internet Gateway (IGW) | NAT Gateway |
+|---|---|---|
+| For | **Public subnets** — resources with public IPs | **Private subnets** — resources with only private IPs |
+| Inbound | Allowed (with SG/NACL rules) | Blocked |
+| Outbound | Allowed | Allowed |
+| IP required | Resource needs Elastic IP or public IP | NAT GW itself has the Elastic IP |
+
+**Route table setup:**
+
+```
+# Public subnet route table:
+0.0.0.0/0  →  Internet Gateway   ← direct internet access
+
+# Private subnet route table:
+0.0.0.0/0  →  NAT Gateway        ← outbound via NAT, no inbound
+```
+
+**NAT Gateway vs NAT Instance:**
+
+NAT Instances (EC2-based NAT) are the old way. NAT Gateway is the managed replacement:
+- NAT Instance: you manage it, single point of failure, limited bandwidth
+- NAT Gateway: AWS manages it, scales to 45 Gbps, 99.9% SLA, no maintenance
+
+**Real scenario:** Our EKS worker nodes lived in private subnets (security requirement — no public IPs on compute). During a deployment, a pod tried to pull an image from Docker Hub and hung indefinitely. The root cause: we'd deployed NAT Gateway in only one AZ, but the worker node was in a different AZ. That AZ's private subnet had no route to a NAT Gateway. Fix: deployed a NAT Gateway in each of the 3 AZs. Rule of thumb: one NAT Gateway per AZ, each pointing to the private subnets in that AZ. Otherwise you're routing cross-AZ traffic through a single NAT — which costs extra (cross-AZ data transfer) and is a failure domain.

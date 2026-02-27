@@ -479,6 +479,8 @@ post {
 
 ## 4. How do you integrate security scans (SAST/DAST) as part of the CI/CD flow?
 
+> **Also asked as:** "What are SAST and DAST?" · "What are SATS and DATS?"
+
 Security scans in CI/CD are about shifting security left — catching vulnerabilities before they reach production. The key is making scans fast enough not to block developers, while failing on genuinely critical issues.
 
 **SAST (Static Application Security Testing) — scans source code.**

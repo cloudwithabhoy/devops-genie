@@ -363,6 +363,8 @@ This is the production-safe approach. It's time-bounded (auto-reverts after 60s)
 
 ## 9. How do you make a Kubernetes cluster highly available?
 
+> **Also asked as:** "How do we make a K8s cluster highly available?"
+
 HA means no single point of failure — any component can die and the cluster keeps running. You need HA at three levels: control plane, worker nodes, and application.
 
 **1. Control Plane HA**
