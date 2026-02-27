@@ -933,3 +933,662 @@ kubectl rollout undo deployment/<app> -n my-namespace
 **Real scenario:** All 12 pods in our `payments` namespace failed readiness at 2:47 AM. No deployment had happened. First check: `kubectl get events` showed nothing unusual. Second check: exec into a pod and curl the health endpoint — got `503 Service Unavailable`. The health endpoint called Redis for a cache check. Third check: `kubectl get pods -n caching` — Redis was in `Pending` (node had been drained for maintenance and the PVC couldn't bind on the new node). Payments pods were healthy; Redis was the root cause. Fix: resolved the PVC binding issue, Redis came up, all 12 pods passed readiness within 90 seconds. No restart needed.
 
 ---
+
+## 14. Node is under disk pressure — pods are being evicted. What do you do?
+
+> **Also asked as:** "What happens when a node hits DiskPressure?" · "Pods are getting evicted with reason DiskPressure — how do you handle it?" · "How do you debug and fix disk pressure on Kubernetes nodes?"
+
+Disk pressure is a node condition — `kubelet` detects that available disk on the node has dropped below a configurable threshold and starts evicting pods to free space. It's one of the more disruptive node conditions because evictions are immediate and pods don't get graceful shutdown time.
+
+**Step 1: Confirm which nodes are under pressure.**
+
+```bash
+kubectl get nodes
+# Look for: DiskPressure=True in the CONDITIONS column
+
+kubectl describe node <node-name>
+# Conditions:
+#   Type            Status  ...
+#   DiskPressure    True    Kubelet has disk pressure.
+#
+# Events:
+#   Evicting pod default/my-app-7f8d5c for disk pressure.
+```
+
+**Step 2: Find out what's consuming disk on the node.**
+
+SSH into the node (or use a privileged debug pod):
+
+```bash
+# Total disk usage breakdown
+df -h
+# The two paths that fill up most in Kubernetes:
+# /var/lib/kubelet    → pod volumes, ConfigMap/Secret mounts, emptyDir
+# /var/lib/containerd (or /var/lib/docker) → container images, overlay layers, container logs
+
+# Find the biggest consumers
+du -sh /var/lib/containerd/*
+du -sh /var/log/pods/*
+du -sh /var/lib/kubelet/pods/*
+```
+
+**Root cause 1: Container image layer accumulation.**
+
+Every image pull leaves layers on disk. Nodes that run many different images (especially in CI-like workloads) accumulate GBs of image data over time.
+
+```bash
+# See all images and their sizes on the node
+crictl images | sort -k4 -h
+
+# Manual cleanup of unused images (dangerous — only run if you know what's deployed)
+crictl rmi --prune
+
+# Preferred: configure kubelet image GC
+# kubelet flags:
+# --image-gc-high-threshold=85   (GC triggers when disk hits 85%)
+# --image-gc-low-threshold=80    (GC brings it back down to 80%)
+# These are the defaults — if you're hitting pressure, lower them to 75/70
+```
+
+**Root cause 2: Container logs not rotating.**
+
+If your app logs excessively (error loops, debug mode left on in prod), the container log files under `/var/log/pods/` grow without bound.
+
+```bash
+# How big are the log files?
+du -sh /var/log/pods/*/*/*.log | sort -h | tail -20
+# One log file showing 10GB+ → your culprit
+
+# Immediate fix: truncate the log file (pod keeps running)
+> /var/log/pods/<namespace>_<pod>_<uid>/<container>/0.log
+
+# Permanent fix: set log rotation in containerd config
+# /etc/containerd/config.toml
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+    ...
+# Or via kubelet container log max size:
+# --container-log-max-size=100Mi
+# --container-log-max-files=3
+```
+
+**Root cause 3: emptyDir volumes filled up.**
+
+Pods writing large temporary files to `emptyDir` mounts can fill a node's disk.
+
+```bash
+# Find which pods have large emptyDir volumes
+du -sh /var/lib/kubelet/pods/*/volumes/kubernetes.io~empty-dir/* 2>/dev/null | sort -h | tail -20
+# Map the pod UID back to a name:
+kubectl get pod --all-namespaces -o custom-columns=NAME:.metadata.name,UID:.metadata.uid | grep <uid>
+```
+
+**Step 3: Immediate remediation.**
+
+```bash
+# 1. Remove stopped/dead containers
+crictl rm $(crictl ps -q --state exited 2>/dev/null) 2>/dev/null
+
+# 2. Remove unused images
+crictl rmi --prune
+
+# 3. If a specific pod's logs are huge, delete and recreate it
+kubectl delete pod <pod> -n <namespace>
+# Deployment will recreate it fresh with empty logs
+
+# 4. If the node is still critical, cordon it first to prevent new scheduling
+kubectl cordon <node-name>
+# Clean up, then:
+kubectl uncordon <node-name>
+```
+
+**Step 4: Prevent it from happening again.**
+
+```yaml
+# Set resource limits on emptyDir in pod specs
+volumes:
+  - name: cache
+    emptyDir:
+      sizeLimit: 1Gi   # Pod is evicted if this volume exceeds 1Gi
+```
+
+```bash
+# Alert before you hit DiskPressure threshold
+# Prometheus alert at 80% disk (before kubelet's 85% GC threshold)
+- alert: NodeDiskUsageHigh
+  expr: |
+    (node_filesystem_size_bytes{mountpoint="/"} - node_filesystem_avail_bytes{mountpoint="/"})
+    / node_filesystem_size_bytes{mountpoint="/"}
+    > 0.80
+  for: 5m
+  labels:
+    severity: warning
+  annotations:
+    summary: "Node {{ $labels.instance }} disk > 80%"
+```
+
+**Real scenario:** At 3 AM, PagerDuty fired — 6 pods evicted on `ip-10-0-1-54`. The node hit DiskPressure. The culprit: a batch job that processed video files wrote the intermediate transcoded files to an `emptyDir` mount with no size limit. A single video file was 40GB uncompressed. The job had been running for 6 hours before kubelet noticed. Immediate fix: deleted the stuck pod, freed 40GB. Permanent fix: added `sizeLimit: 5Gi` to the emptyDir, added a Prometheus alert at 75% disk, and moved large file processing to use S3 as intermediate storage instead of local disk. Never hit DiskPressure again.
+
+---
+
+## 15. Services are returning 502 / 503 errors — how do you trace the root cause?
+
+> **Also asked as:** "502 Bad Gateway from your Ingress — what do you check?" · "503 Service Unavailable on a K8s service — how do you debug?" · "Users report 502 errors but pods look healthy — how do you triage?"
+
+502 and 503 are proxying errors — the gateway received your request but couldn't get a valid response from the upstream. In Kubernetes, the chain is: `Client → Ingress Controller → Service → Pod`. The failure can be at any hop.
+
+**Step 1: Identify where in the chain the error originates.**
+
+```bash
+# Check Ingress controller logs (nginx-ingress, or ALB ingress)
+kubectl logs -n ingress-nginx -l app.kubernetes.io/name=ingress-nginx --tail=50
+
+# Nginx ingress: look for upstream errors
+# [error] ... connect() failed (111: Connection refused) while connecting to upstream
+# [error] ... upstream timed out (110: Connection timed out)
+# [error] ... no live upstreams while connecting to upstream
+
+# These tell you:
+# "Connection refused"   → Pod is up but nothing is listening on that port
+# "Connection timed out" → Pod is unreachable or overwhelmed
+# "no live upstreams"    → Service has no Ready endpoints (all pods failing readiness)
+```
+
+**Step 2: Check if the Service has Endpoints.**
+
+```bash
+# Does the Service point to any pods?
+kubectl get endpoints <service-name> -n <namespace>
+# NAME           ENDPOINTS                     AGE
+# my-service     10.0.1.5:8080,10.0.1.6:8080  2d   ← healthy
+# my-service     <none>                         2d   ← 503: no endpoints
+
+# Why are there no endpoints? Check pod readiness:
+kubectl get pods -n <namespace> -l app=my-app
+# 0/1 READY → readiness probe failing → Service removes it from endpoints
+```
+
+**Step 3: Check readiness probe.**
+
+503 from K8s services almost always means: Service has no ready pods. The pod is Running but failing its readiness probe.
+
+```bash
+kubectl describe pod <pod> -n <namespace>
+# Events:
+#   Readiness probe failed: HTTP probe failed with statuscode: 500
+#   Readiness probe failed: dial tcp 10.0.1.5:8080: connect: connection refused
+
+# The probe path is wrong (404 instead of 200):
+kubectl describe ingress <name> -n <namespace>
+# Check the path — did the app change its health endpoint from /health to /healthz?
+```
+
+**Step 4: 502 under load — upstream timeout.**
+
+502 during traffic spikes usually means pods are responding too slowly and the Ingress times out waiting for them.
+
+```bash
+# Check pod CPU throttling — are pods getting throttled under load?
+kubectl top pods -n <namespace>
+
+# Check if HPA is keeping up — are replicas scaling fast enough?
+kubectl get hpa -n <namespace>
+# TARGETS: 95%/70% → HPA wants to scale but hasn't yet → existing pods overwhelmed
+
+# Nginx ingress: increase proxy timeout if your app legitimately needs more time
+# Add annotation to Ingress:
+nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
+nginx.ingress.kubernetes.io/proxy-connect-timeout: "30"
+```
+
+**Step 5: Check for connection draining issues during rolling updates.**
+
+502s that happen exactly during deployments are almost always connection draining — old pods die before in-flight requests complete.
+
+```bash
+# Add preStop hook to delay pod termination (allow in-flight requests to finish)
+lifecycle:
+  preStop:
+    exec:
+      command: ["/bin/sh", "-c", "sleep 15"]
+
+# Also set terminationGracePeriodSeconds to be longer than your slowest request
+spec:
+  terminationGracePeriodSeconds: 60
+```
+
+**Step 6: ALB / AWS-specific 502s.**
+
+If you're on EKS with AWS ALB Ingress:
+
+```bash
+# Check ALB target group health in AWS console or CLI
+aws elbv2 describe-target-health \
+  --target-group-arn <arn> \
+  --query 'TargetHealthDescriptions[*].{Target:Target.Id,Port:Target.Port,State:TargetHealth.State,Reason:TargetHealth.Reason}'
+
+# "unhealthy" with reason "Target.FailedHealthChecks" → ALB health check failing
+# The ALB health check path might differ from the K8s readiness probe path
+# Check: does /healthz return 200? Does the security group allow ALB to reach pod port?
+```
+
+**Decision tree:**
+
+```
+502/503 from users
+    ↓
+kubectl get endpoints <svc> → empty?
+    ↓ Yes → pods failing readiness → kubectl describe pod → fix probe/app
+    ↓ No (endpoints exist)
+  Ingress logs → "connection refused"?
+    ↓ Yes → pod is up but wrong port exposed / app not listening on container port
+    ↓ No → "upstream timed out"?
+      ↓ Yes → pods overwhelmed (scale out / tune timeout) or rolling update draining issue
+      ↓ No → check ALB target health, SG rules, pod resource limits
+```
+
+**Real scenario:** On a Black Friday sale, our checkout service started returning 502s at 11:03 AM — right when traffic spiked 5x. Pods were `1/1 Running`. Ingress logs showed `upstream timed out`. The root cause: our checkout pods had `cpu: 200m` limit. Under load, every pod was CPU-throttled to 200m. Requests piled up. Ingress waited 60 seconds (default), then sent 502. Fix: doubled CPU limit to 400m, added HPA with target CPU 60% (was 80%), added `proxy-read-timeout: 120` annotation. 502s stopped within 3 minutes of the rollout. We also added a Grafana alert for P95 latency > 5s to catch this before users do.
+
+---
+
+## 16. DB connection timeouts from pods — how do you diagnose and fix?
+
+> **Also asked as:** "Pods are getting connection timeout to the database — what do you check?" · "Application logs show 'connection pool exhausted' — how do you debug?" · "Database connections from K8s pods are timing out intermittently."
+
+DB connection timeouts are deceptive — the app is healthy, the database is healthy, but something in between is breaking connections. The cause is almost always one of: connection pool exhaustion, idle connection termination, NetworkPolicy blocking, or DNS resolution issues.
+
+**Step 1: Read the actual error message carefully.**
+
+```bash
+kubectl logs <pod> -n <namespace> | grep -i "timeout\|connect\|refused\|pool\|exhausted" | tail -30
+
+# Error categories:
+# "connection timeout"          → can't establish TCP connection at all
+# "connection refused"          → DB port is not open or firewall blocking
+# "too many connections"        → DB server connection limit hit
+# "connection pool exhausted"   → app-side pool full, not a network issue
+# "connection reset by peer"    → idle connection killed by something in between
+# "could not translate host name" → DNS resolution failure for DB hostname
+```
+
+**Step 2: Test connectivity from the pod directly.**
+
+```bash
+# Can the pod reach the DB at all?
+kubectl exec -n <namespace> <pod> -- nc -zv <db-host> 5432
+# Success: Connection to <db-host> 5432 port [tcp/postgresql] succeeded!
+# Failure: nc: connect to <db-host> port 5432 (tcp) failed: Connection refused
+
+# If using RDS — is the RDS endpoint resolvable?
+kubectl exec -n <namespace> <pod> -- nslookup my-db.cluster-xyz.ap-south-1.rds.amazonaws.com
+# If nslookup fails → DNS issue, not DB issue
+```
+
+**Step 3: Check NetworkPolicy.**
+
+A common cause — NetworkPolicy allows egress on port 443/80 but forgets port 5432/3306:
+
+```bash
+kubectl get networkpolicy -n <namespace> -o yaml | grep -A 20 "egress"
+# Look for a rule allowing egress to the DB namespace or CIDR on the DB port
+
+# If no rule exists for port 5432, pods are silently blocked
+# Fix: add egress rule
+```
+
+```yaml
+# NetworkPolicy fix: allow egress to RDS (or DB service)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-db-egress
+  namespace: my-app
+spec:
+  podSelector:
+    matchLabels:
+      app: my-app
+  egress:
+    - ports:
+        - port: 5432
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 10.0.0.0/8    # Your DB subnet CIDR
+```
+
+**Step 4: Connection pool exhaustion (the most common cause).**
+
+The app can reach the DB, but its connection pool is full — new requests queue up and timeout waiting for a free connection.
+
+```bash
+# On the app side: check connection pool metrics
+# For Java (HikariCP):
+kubectl exec <pod> -- curl -s http://localhost:9090/actuator/metrics/hikaricp.connections
+# Look for: "hikaricp.connections.pending" > 0 for sustained period → pool exhausted
+
+# On the DB side: check active connections
+# For PostgreSQL:
+psql -h <rds-endpoint> -U admin -c "SELECT count(*), state FROM pg_stat_activity GROUP BY state;"
+# state="active" count near max_connections → DB connection limit hit
+
+# Check PostgreSQL max_connections
+psql -h <rds-endpoint> -U admin -c "SHOW max_connections;"
+# RDS db.t3.micro default: 66 connections. 10 pods × 10 pool size = 100 > 66 → exhausted
+```
+
+**Fix: Tune pool size to match DB limits.**
+
+```yaml
+# Application environment variables — tune connection pool
+env:
+  - name: DB_POOL_SIZE
+    value: "5"      # Max 5 connections per pod
+  - name: DB_POOL_MIN_IDLE
+    value: "2"
+  - name: DB_POOL_TIMEOUT
+    value: "30000"  # 30 seconds — fail fast rather than queue forever
+  - name: DB_POOL_MAX_LIFETIME
+    value: "1800000"  # 30 minutes — recycle connections before AWS NLB kills them at 350s
+```
+
+**Step 5: Idle connection termination by AWS NLB/NAT Gateway.**
+
+This is a sneaky one. AWS NAT Gateway silently kills idle TCP connections after **350 seconds** of inactivity. Your connection pool keeps a "healthy" connection that was idle for 6 minutes — it's actually dead. The next query fails.
+
+```bash
+# Look for errors that appear after periods of low traffic (nights, weekends)
+# "broken pipe", "connection reset by peer" in logs → idle connection killed
+
+# Fix: enable TCP keepalive at the connection pool level
+# For HikariCP:
+spring.datasource.hikari.keepalive-time=300000   # 5 minutes — heartbeat before NAT kills at 350s
+spring.datasource.hikari.connection-timeout=30000
+spring.datasource.hikari.max-lifetime=900000     # 15 minutes — well under NAT Gateway's limit
+
+# For SQLAlchemy (Python):
+pool_pre_ping=True   # Tests connection before using it — catches dead connections
+pool_recycle=300     # Recycle connections every 5 minutes
+```
+
+**Step 6: Use PgBouncer / RDS Proxy to reduce connection pressure.**
+
+If you're running 50+ pods against a single RDS instance, raw connection pooling is not scalable. Add a connection pooler:
+
+```yaml
+# PgBouncer as a sidecar or dedicated deployment
+# Each pod connects to PgBouncer (cheap) → PgBouncer maintains a small pool to RDS (expensive)
+# 50 pods × 10 connections to PgBouncer = 500 "connections"
+# PgBouncer → RDS: 10 actual connections
+# RDS stays within max_connections limit
+```
+
+**Real scenario:** Our Node.js API started throwing `ETIMEDOUT` errors every Monday morning at 9 AM when users came back online after the weekend. DB was healthy, pods were healthy. The logs showed errors starting exactly 6 minutes after the first Monday morning request — pointing to connections that had been idle all weekend. The root cause: AWS NAT Gateway killed idle connections at 350 seconds. Our connection pool's `max-lifetime` was 3 hours — way longer than NAT Gateway's limit. Fix: set `max-lifetime: 300000` (5 minutes), `keepalive-time: 60000` (1 minute heartbeat). Monday morning `ETIMEDOUT` errors: gone.
+
+---
+
+## 17. Rolling update is broken — pods are stuck and traffic is disrupted. What do you do?
+
+> **Also asked as:** "Deployment rollout is stuck — how do you fix it?" · "Rolling update left old and new pods running — service is returning errors" · "How do you handle a bad deployment mid-rollout?" · "Deployment stuck in Terminating state during rolling update."
+
+A broken rolling update is a live incident. Old pods are dying, new pods are not becoming ready, and your service has degraded capacity — or is completely down if the PodDisruptionBudget isn't configured.
+
+**Step 1: Check the rollout status immediately.**
+
+```bash
+kubectl rollout status deployment/<name> -n <namespace>
+# Waiting for deployment "my-app" rollout to finish: 2 out of 3 new replicas have been updated...
+# → New pods aren't becoming Ready fast enough
+
+# How long has it been stuck?
+kubectl get deployment <name> -n <namespace>
+# READY: 1/3  UP-TO-DATE: 3  AVAILABLE: 1
+# → 3 pods updated but only 1 ready — new pods are crashing or failing readiness
+```
+
+**Step 2: Find why new pods aren't becoming ready.**
+
+```bash
+# Look at the new pods (ReplicaSet created by the rollout)
+kubectl get pods -n <namespace> -l app=my-app --sort-by='.metadata.creationTimestamp'
+# Last few pods are the new ones — what state are they in?
+
+kubectl describe pod <new-pod> -n <namespace>
+# Events will tell you:
+# CrashLoopBackOff → new image has a startup crash
+# ImagePullBackOff → image tag doesn't exist (typo in CI pipeline)
+# Readiness probe failed → new version returns non-200 on /health
+# OOMKilled → new version has a memory regression
+```
+
+**Step 3: Rollback immediately if the new version is broken.**
+
+Don't wait. If new pods aren't ready and old pods are still partially running, rollback before more old pods get terminated:
+
+```bash
+# Instant rollback to previous ReplicaSet
+kubectl rollout undo deployment/<name> -n <namespace>
+# deployment.apps/<name> rolled back
+
+# Verify rollback is progressing
+kubectl rollout status deployment/<name> -n <namespace>
+
+# If you need to rollback to a specific revision:
+kubectl rollout history deployment/<name> -n <namespace>
+kubectl rollout undo deployment/<name> -n <namespace> --to-revision=3
+```
+
+**Step 4: Pods stuck in `Terminating` during rollout.**
+
+Old pods sometimes get stuck in `Terminating` — they refuse to die. This leaves the cluster in a split-brain state with old and new versions both serving traffic.
+
+```bash
+# Check if pod is stuck terminating
+kubectl get pods -n <namespace>
+# my-app-old-xyz   0/1  Terminating   0   15m   ← stuck
+
+kubectl describe pod my-app-old-xyz -n <namespace>
+# Check for finalizers — a finalizer is blocking deletion
+# metadata:
+#   finalizers:
+#     - foregroundDeletion
+
+# Check if a PodDisruptionBudget is blocking termination
+kubectl get pdb -n <namespace>
+kubectl describe pdb <name> -n <namespace>
+# DISRUPTIONS ALLOWED: 0 → PDB is preventing the old pod from being terminated
+# because the new pods haven't reached Ready state yet
+```
+
+**Fix PDB blocking rollout:**
+
+```yaml
+# Your PDB might be too strict for deployments
+# Wrong: always keep 100% of pods available (blocks all rolling updates)
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+spec:
+  minAvailable: 3   # Same as replicas — no pod can ever be terminated
+
+# Right: allow 1 disruption during rollout
+spec:
+  minAvailable: 2   # With 3 replicas: 1 pod can be down during rollout
+  # or:
+  maxUnavailable: 1
+```
+
+**Step 5: Configure rolling update strategy to prevent disruption.**
+
+```yaml
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1          # Spin up 1 extra pod before terminating old ones
+      maxUnavailable: 0    # Never reduce capacity below desired replicas
+  # With 3 replicas: scale to 4 (surge), wait for new pod ready, terminate 1 old
+  # Guarantees zero capacity reduction during rollout
+  # Trade-off: needs headroom for the surge pod (node capacity)
+```
+
+**Step 6: Add a readinessProbe with proper timing.**
+
+The most common cause of broken rolling updates: new pods get traffic before they're ready (no readiness probe, or probe timing is too aggressive).
+
+```yaml
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  initialDelaySeconds: 30   # Wait 30s before first check (app startup time)
+  periodSeconds: 10
+  failureThreshold: 3       # 3 failures = 30s before pod is marked NotReady
+  successThreshold: 1
+```
+
+**Real scenario:** We pushed a new Docker image to prod at 6 PM. The rolling update started — 2 new pods came up, 1 old pod was terminated. Then PagerDuty fired: 40% error rate. The new pods were `Running` but not `Ready` — the `/health` endpoint returned 200 only after a DB migration completed (which took ~90 seconds). Our `initialDelaySeconds` was 5 seconds. K8s marked the pod Ready at 5s, started sending traffic, and the app returned 500 until the migration finished at 90s. Meanwhile, we'd already killed 1 old pod. Immediate fix: `kubectl rollout undo` — service recovered in 45 seconds. Permanent fix: increased `initialDelaySeconds: 120` and added a proper readiness endpoint that checks DB connectivity before returning 200. Rollouts have been clean since.
+
+---
+
+## 18. Pods can't resolve DNS inside the cluster — how do you debug it?
+
+> **Also asked as:** "Service discovery is broken — pods can't reach each other by hostname" · "nslookup fails from inside a pod — how do you fix it?" · "CoreDNS is not resolving service names — what do you check?" · "Intermittent DNS timeouts in Kubernetes pods — root cause?"
+
+DNS in Kubernetes is handled by CoreDNS. Every pod gets `nameserver <CoreDNS-ClusterIP>` injected into its `/etc/resolv.conf`. When DNS breaks, pods can't find each other by service name — all service-to-service communication fails.
+
+**Step 1: Confirm it's actually DNS (not a network or app issue).**
+
+```bash
+# Run a debug pod with DNS tools
+kubectl run dns-debug --image=busybox:1.28 --rm -it --restart=Never -- sh
+
+# Inside the pod:
+nslookup kubernetes.default
+# Expected: Server: 10.96.0.10 (CoreDNS ClusterIP)
+#           Address: 10.96.0.1 (kubernetes service ClusterIP)
+# If this fails → CoreDNS is the problem
+
+nslookup my-service.my-namespace.svc.cluster.local
+# If kubernetes.default works but this fails → CoreDNS is up, DNS entry missing
+# (Service might not exist, wrong namespace, wrong name)
+
+nslookup google.com
+# If internal resolves but external doesn't → CoreDNS upstream forwarder issue
+```
+
+**Step 2: Check CoreDNS pods.**
+
+```bash
+kubectl get pods -n kube-system -l k8s-app=kube-dns
+# Both pods should be Running 1/1
+# If CrashLoopBackOff → CoreDNS itself is broken
+# If only 1 of 2 running → degraded, still working but single point of failure
+
+kubectl logs -n kube-system -l k8s-app=kube-dns --tail=50
+# Look for:
+# [ERROR] plugin/errors: 2 SERVFAIL → upstream DNS not reachable
+# [ERROR] Failed to list *v1.Namespace → CoreDNS can't reach API server (RBAC issue)
+# OOMKilled → CoreDNS is out of memory (usually means it's overwhelmed)
+```
+
+**Step 3: CoreDNS is saturated (the most common production issue).**
+
+High-traffic clusters overload CoreDNS. Signs: intermittent timeouts, not a complete failure.
+
+```bash
+# Check CoreDNS CPU/memory
+kubectl top pods -n kube-system -l k8s-app=kube-dns
+# If CPU is consistently near limit → CoreDNS is throttled, causing DNS timeouts
+
+# Check DNS request rate (in Prometheus/Grafana)
+rate(coredns_dns_requests_total[5m])
+# Spike in requests = traffic burst; consistent high rate = needs more replicas
+
+# Fix 1: Scale CoreDNS
+kubectl scale deployment coredns -n kube-system --replicas=4
+# Spread the DNS load
+
+# Fix 2: Set HPA for CoreDNS
+kubectl autoscale deployment coredns -n kube-system \
+  --min=2 --max=10 --cpu-percent=70
+```
+
+**Step 4: Reduce DNS load with ndots tuning.**
+
+The default `ndots: 5` causes every external DNS lookup to make 5 queries before resolving the absolute name. For services that call external APIs frequently, this multiplies CoreDNS load by 5x.
+
+```yaml
+# For pods that primarily call external services
+spec:
+  dnsConfig:
+    options:
+      - name: ndots
+        value: "2"    # Reduces search domain attempts from 5 to 2
+      - name: single-request-reopen
+        # Forces separate sockets for A and AAAA queries
+        # Fixes a race condition in glibc that causes intermittent DNS failures
+```
+
+**Step 5: CoreDNS ConfigMap is misconfigured.**
+
+Sometimes a manual edit to CoreDNS config breaks resolution for specific domains.
+
+```bash
+kubectl describe configmap coredns -n kube-system
+# Check the Corefile — look for obvious syntax errors or missing blocks
+
+# Default working Corefile (EKS/standard clusters):
+# .:53 {
+#     errors
+#     health {
+#         lameduck 5s
+#     }
+#     ready
+#     kubernetes cluster.local in-addr.arpa ip6.arpa {
+#         pods insecure
+#         fallthrough in-addr.arpa ip6.arpa
+#     }
+#     prometheus :9153
+#     forward . /etc/resolv.conf
+#     cache 30
+#     loop
+#     reload
+#     loadbalance
+# }
+
+# Restore to default if broken:
+kubectl rollout restart deployment coredns -n kube-system
+```
+
+**Step 6: Check the pod's `/etc/resolv.conf`.**
+
+```bash
+kubectl exec -n <namespace> <pod> -- cat /etc/resolv.conf
+# Expected:
+# nameserver 10.96.0.10          ← CoreDNS ClusterIP
+# search default.svc.cluster.local svc.cluster.local cluster.local
+# options ndots:5
+
+# If nameserver is 127.0.0.1 or the host's IP → kubelet misconfiguration
+# The kubelet --cluster-dns flag should point to CoreDNS ClusterIP
+
+# Get CoreDNS ClusterIP:
+kubectl get svc kube-dns -n kube-system
+# NAME       TYPE        CLUSTER-IP   EXTERNAL-IP   PORT(S)         AGE
+# kube-dns   ClusterIP   10.96.0.10   <none>        53/UDP,53/TCP   45d
+```
+
+**Common DNS failure patterns:**
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| All DNS fails | CoreDNS pods down | Restart/scale CoreDNS |
+| Intermittent failures under load | CoreDNS CPU saturated | Scale CoreDNS, tune ndots |
+| External DNS works, internal fails | CoreDNS can't reach API server | Check RBAC for CoreDNS ServiceAccount |
+| Internal DNS works, external fails | Upstream forwarder blocked | Check SG/NACL allows UDP 53 outbound |
+| DNS slow (200-500ms per lookup) | ndots:5 + external hostnames | Set ndots:2, use FQDN with trailing dot |
+| Works in one namespace, fails in another | Search domain mismatch | Use FQDN: `service.namespace.svc.cluster.local` |
+
+**Real scenario:** Our microservices started throwing `ENOTFOUND` errors for internal service names at random — maybe 2% of requests. Not a total outage. I assumed it was a transient network blip. It lasted 3 days before I dug in. CoreDNS metrics showed CPU at 98% consistently. The cause: we'd onboarded a new service that called 12 different external APIs on every request, with `ndots: 5` and no connection pooling. Each request triggered 5 DNS lookups per API call × 12 APIs = 60 CoreDNS queries per request. At 200 RPS, that's 12,000 CoreDNS queries per second. We'd provisioned CoreDNS for 3,000 QPS. Fix: increased CoreDNS replicas from 2 to 5, set `ndots: 2` for that service's pods, switched the service to use IP-based calls for internal services. DNS errors: zero.
+
+---
