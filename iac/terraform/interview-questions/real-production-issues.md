@@ -632,3 +632,188 @@ terraform plan
 ```
 
 **Real scenario:** A Terraform apply that provisioned a new EKS cluster failed after creating the cluster and node groups, but before creating the Kubernetes RBAC resources (aws-auth ConfigMap update). The cluster existed in AWS. The state file was partially updated — it had the EKS cluster but not the RBAC config. Re-running `terraform apply` without fixing anything: Terraform tried to re-create the EKS cluster (it was in state, then the apply failure removed it from state mid-write). Fix: ran `terraform import aws_eks_cluster.main prod-cluster` to re-add the cluster to state, then `terraform apply` which correctly saw "cluster exists, just apply the missing RBAC resources." Full recovery in 12 minutes.
+
+---
+
+## 6. Terraform state is locked — pipeline is blocked and nobody knows who locked it. What do you do?
+
+> **Also asked as:** "Terraform state lock error — how do you release it safely?" · "terraform apply says 'Error acquiring the state lock' — what's happening?" · "Someone left a Terraform lock on the state — how do you force-unlock without breaking things?"
+
+State locking is Terraform's protection against concurrent applies that would corrupt the state file. When you see a lock error, something — a pipeline, a developer's local machine, or a crashed process — holds a DynamoDB lock record. The dangerous move is to immediately force-unlock. The right move is to investigate first.
+
+**The error you see:**
+
+```
+╷
+│ Error: Error acquiring the state lock
+│
+│ Error message: ConditionalCheckFailedException: The conditional request failed
+│
+│ Lock Info:
+│   ID:        f23a8b91-4e12-4c3c-b8e7-a9f2e1234567
+│   Path:      s3://my-tf-state/prod/main/terraform.tfstate
+│   Operation: OperationTypeApply
+│   Who:       runner@ip-10-0-1-55
+│   Version:   1.6.0
+│   Created:   2024-01-15 09:34:12.123456789 +0000 UTC
+│   Info:
+╵
+```
+
+This tells you everything: Lock ID, who locked it (`runner@ip-10-0-1-55` — a CI runner), what operation (`Apply`), and when it was created.
+
+**Step 1: Verify the locking process is actually dead.**
+
+Before unlocking anything, answer: **is this lock held by an active process?**
+
+```bash
+# Check the DynamoDB lock table directly
+aws dynamodb get-item \
+  --table-name terraform-state-lock \
+  --key '{"LockID": {"S": "my-tf-state/prod/main/terraform.tfstate"}}' \
+  --region ap-south-1
+
+# The item exists → lock is held. Note the "Info" field — it has the runner ID.
+
+# Is the CI pipeline still running?
+# → Check your CI provider (GitHub Actions, Jenkins) for a running job with that runner ID
+# → If the job is still running → DO NOT unlock. Wait for it to finish.
+# → If the job shows "Failed" or doesn't exist → lock is stale, safe to unlock
+```
+
+**Step 2: Check the S3 state file for a concurrent write.**
+
+A locked state file might be in the middle of a write. Check the object:
+
+```bash
+aws s3api head-object \
+  --bucket my-tf-state \
+  --key prod/main/terraform.tfstate
+
+# Check "LastModified" timestamp
+# If it matches when the pipeline crashed → the apply wrote a partial state
+# Always download and inspect the state before unlocking if you're not sure:
+aws s3 cp s3://my-tf-state/prod/main/terraform.tfstate /tmp/state-backup.json
+cat /tmp/state-backup.json | python3 -m json.tool | head -50
+# Is it valid JSON? Is it non-empty? → State is intact
+```
+
+**Step 3: Force-unlock once you've confirmed the process is dead.**
+
+```bash
+# Force-unlock using the Lock ID from the error message
+terraform force-unlock f23a8b91-4e12-4c3c-b8e7-a9f2e1234567
+
+# Terraform prompts: "Do you really want to force-unlock? (yes/no)"
+# Type "yes"
+
+# Output:
+# Terraform state has been successfully unlocked!
+# The state has been unlocked, and Terraform operations can now proceed.
+```
+
+**Manually remove the DynamoDB lock if `terraform force-unlock` fails:**
+
+```bash
+# Direct DynamoDB delete (last resort — use if terraform CLI itself can't connect)
+aws dynamodb delete-item \
+  --table-name terraform-state-lock \
+  --key '{"LockID": {"S": "my-tf-state/prod/main/terraform.tfstate"}}' \
+  --region ap-south-1
+```
+
+**Step 4: After unlocking — run plan before apply.**
+
+```bash
+# Always run plan first after a force-unlock
+# The previous apply may have made partial changes
+terraform plan
+
+# Review the plan carefully:
+# - Resources that show "will be created" but already exist in AWS → need import
+# - Resources that show "will be destroyed" that shouldn't be → DO NOT apply, investigate
+# - Plan shows "No changes" → previous apply completed successfully, lock was stale
+
+# If plan looks clean, run apply
+terraform apply
+```
+
+**Step 5: Find and fix why locks get abandoned.**
+
+Stale locks are almost always caused by one of these:
+
+```
+1. CI pipeline killed mid-apply (job timeout, manual cancel, runner crash)
+2. Local apply: laptop closed, network dropped, Ctrl+C during apply
+3. Terraform crash (OOM, bug) — lock acquired but cleanup code never ran
+4. EC2/runner instance terminated while apply was running
+```
+
+**Prevention — never let your pipeline leave a stale lock:**
+
+```yaml
+# GitHub Actions: release lock even on pipeline cancellation
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Terraform Apply
+        id: apply
+        run: terraform apply -auto-approve
+
+      # This always runs, even if the job is cancelled
+      - name: Release lock on failure
+        if: always() && steps.apply.outcome == 'failure'
+        run: |
+          # Get the lock ID from the error output and force-unlock
+          terraform force-unlock -force $(terraform state list 2>&1 | grep "Lock ID" | awk '{print $3}')
+```
+
+```hcl
+# Terraform backend with S3 + DynamoDB locking
+terraform {
+  backend "s3" {
+    bucket         = "my-tf-state"
+    key            = "prod/main/terraform.tfstate"
+    region         = "ap-south-1"
+    dynamodb_table = "terraform-state-lock"   # Lock table
+    encrypt        = true
+
+    # Important: set a lock timeout so stuck locks auto-expire
+    # Unfortunately Terraform doesn't support lock TTL natively —
+    # use a DynamoDB TTL attribute approach:
+  }
+}
+```
+
+```bash
+# DynamoDB TTL on lock records — auto-expire stale locks after 1 hour
+# Add a TTL attribute to your lock table:
+aws dynamodb update-time-to-live \
+  --table-name terraform-state-lock \
+  --time-to-live-specification "Enabled=true, AttributeName=TTL"
+
+# Then in your CI: write TTL when acquiring lock
+# (requires a wrapper script — not natively supported by Terraform)
+# Alternative: use Terragrunt which adds lock TTL support
+```
+
+**Lock management cheat sheet:**
+
+```bash
+# See who holds the lock
+aws dynamodb scan --table-name terraform-state-lock
+
+# Force-unlock
+terraform force-unlock <lock-id>
+
+# Force-unlock without interactive prompt (CI use)
+terraform force-unlock -force <lock-id>
+
+# Backup state before any force-unlock
+aws s3 cp s3://bucket/path/terraform.tfstate ./tfstate-backup-$(date +%Y%m%d-%H%M%S).json
+```
+
+**Real scenario:** On a Friday afternoon, a developer triggered a `terraform apply` from their laptop to add a new security group rule. Midway through, their laptop went into sleep mode — VPN dropped, the SSH session died. The apply was still running on Terraform Cloud... except we weren't using Terraform Cloud. It was a local run. The process was dead, but DynamoDB still held the lock record. The CI pipeline queued 4 deploys over the next 3 hours — all blocked by the lock. The on-call engineer came in Saturday morning, saw the lock info (`Who: user@macbook-pro-local`), confirmed the developer's laptop was offline, and ran `terraform force-unlock`. Before applying, ran `terraform plan` — it showed one change (the security group rule the developer was adding) because the apply had died before completing. The plan was clean, `terraform apply` succeeded in 30 seconds. Post-incident: enforced Terraform Cloud for all team applies (locks have TTL + audit trail), banned local applies to production state.
+
+---
