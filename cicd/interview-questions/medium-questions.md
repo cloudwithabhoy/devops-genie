@@ -96,6 +96,8 @@ strategy:
 
 ## 3. How do you manage pipeline configurations and rollback strategies?
 
+> **Also asked as:** "How do you find errors in the pipelines?"
+
 **Managing pipeline configurations:**
 
 Pipeline configuration lives in code — not in a CI server's UI. This is non-negotiable in production.
@@ -876,6 +878,175 @@ stage('Trigger ArgoCD Sync') {
 ```
 
 We avoid this pattern because it couples Jenkins to ArgoCD — if ArgoCD is temporarily unavailable, the Jenkins pipeline fails. With the Git-commit approach, Jenkins always succeeds (it just pushes to Git), and ArgoCD syncs whenever it's ready.
+
+---
+
+## 9. How is the CI/CD pipeline set up in your project? What security tools are integrated and how do you manage them?
+
+> **Also asked as:** "Walk me through your CI/CD pipeline" · "How do you manage security in your pipeline?" · "What DevSecOps tools do you use in CI/CD?" · "Write a rough pipeline script for microservices architecture."
+
+This is a "show your work" question. The interviewer wants to see a real pipeline, not a textbook list of tools.
+
+**Our pipeline: Jenkins + Docker + ECR + ArgoCD on EKS**
+
+```
+Developer pushes code to GitHub
+    ↓
+GitHub Webhook → Jenkins (triggers pipeline)
+    ↓
+Stage 1: Code Checkout + Dependency Install
+Stage 2: Unit Tests + Code Coverage
+Stage 3: SAST (SonarQube)           ← security
+Stage 4: Docker Build (multi-stage)
+Stage 5: Image Scan (Trivy)          ← security
+Stage 6: Push to ECR
+Stage 7: Update K8s Manifest (GitOps)
+Stage 8: ArgoCD auto-syncs → deploys to EKS
+Stage 9: Smoke Test (post-deploy validation)
+Stage 10: Slack Notification (pass/fail)
+```
+
+**Rough Jenkinsfile for a microservices architecture:**
+
+```groovy
+pipeline {
+  agent any
+
+  environment {
+    APP_NAME     = "order-service"
+    ECR_REGISTRY = "123456789.dkr.ecr.ap-south-1.amazonaws.com"
+    IMAGE_TAG    = "${env.GIT_COMMIT[0..6]}"
+    SONAR_URL    = "http://sonarqube.internal:9000"
+    K8S_REPO     = "git@github.com:org/k8s-manifests.git"
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Unit Tests') {
+      steps {
+        sh 'mvn test -q'
+        junit 'target/surefire-reports/*.xml'
+        jacoco execPattern: 'target/jacoco.exec'
+      }
+    }
+
+    stage('SAST - SonarQube') {
+      steps {
+        withSonarQubeEnv('sonarqube') {
+          sh '''
+            mvn sonar:sonar \
+              -Dsonar.projectKey=${APP_NAME} \
+              -Dsonar.host.url=${SONAR_URL}
+          '''
+        }
+        // Block pipeline if Quality Gate fails
+        timeout(time: 5, unit: 'MINUTES') {
+          waitForQualityGate abortPipeline: true
+        }
+      }
+    }
+
+    stage('Docker Build') {
+      steps {
+        sh "docker build -t ${ECR_REGISTRY}/${APP_NAME}:${IMAGE_TAG} ."
+      }
+    }
+
+    stage('Image Scan - Trivy') {
+      steps {
+        sh """
+          trivy image \
+            --exit-code 1 \
+            --severity CRITICAL \
+            --ignore-unfixed \
+            ${ECR_REGISTRY}/${APP_NAME}:${IMAGE_TAG}
+        """
+      }
+    }
+
+    stage('Push to ECR') {
+      steps {
+        withAWS(credentials: 'aws-ecr-creds', region: 'ap-south-1') {
+          sh """
+            aws ecr get-login-password | docker login \
+              --username AWS \
+              --password-stdin ${ECR_REGISTRY}
+            docker push ${ECR_REGISTRY}/${APP_NAME}:${IMAGE_TAG}
+          """
+        }
+      }
+    }
+
+    stage('Update Manifest (GitOps)') {
+      steps {
+        sshagent(['github-deploy-key']) {
+          sh """
+            git clone ${K8S_REPO} k8s-manifests
+            cd k8s-manifests
+            sed -i "s|image: .*${APP_NAME}.*|image: ${ECR_REGISTRY}/${APP_NAME}:${IMAGE_TAG}|" \
+              apps/${APP_NAME}/deployment.yaml
+            git config user.email "jenkins@ci.internal"
+            git config user.name "Jenkins"
+            git add .
+            git commit -m "ci: update ${APP_NAME} to ${IMAGE_TAG}"
+            git push origin main
+          """
+        }
+      }
+    }
+
+    stage('Smoke Test') {
+      steps {
+        sleep(30)   // Wait for ArgoCD to sync
+        sh """
+          curl -sf https://api.prod.internal/orders/health \
+            || (echo "Smoke test failed" && exit 1)
+        """
+      }
+    }
+  }
+
+  post {
+    success {
+      slackSend channel: '#deployments',
+        color: 'good',
+        message: "✅ ${APP_NAME}:${IMAGE_TAG} deployed to prod"
+    }
+    failure {
+      slackSend channel: '#deployments',
+        color: 'danger',
+        message: "❌ Pipeline failed: ${APP_NAME} — ${env.BUILD_URL}"
+    }
+  }
+}
+```
+
+**Security tools integrated and how we manage them:**
+
+| Tool | Stage | What it checks | Fail condition |
+|---|---|---|---|
+| SonarQube | After unit tests | Code quality, OWASP bugs, code smells, coverage | Quality Gate fails (configurable thresholds) |
+| Trivy | After Docker build | OS package CVEs, language dependency CVEs | Any CRITICAL with a fix available |
+| OWASP Dependency-Check | During build | Known vulnerable dependencies (CVE database) | CVSS score > 7 |
+| Checkov | On Terraform/K8s YAML | IaC misconfigurations (public S3, permissive SGs) | Any HIGH severity finding |
+| Gitleaks | Pre-commit + CI | Secrets accidentally committed to Git | Any secret pattern match |
+
+**How we manage these tools:**
+
+**SonarQube:** Self-hosted on a dedicated EC2 instance. Quality Gates configured per project — stricter for payment services (0 critical bugs, coverage > 80%) than internal tooling. Credentials stored in Jenkins as a secret text credential.
+
+**Trivy:** Run as a Docker container in the pipeline — no installation needed. `trivy image` downloads the vulnerability DB on first run and caches it. We update the DB cache daily via a scheduled Jenkins job so pipeline scans are fast.
+
+**Gitleaks:** Added as a GitHub Actions pre-check that runs before Jenkins even starts. Catches leaked secrets before they reach CI — API keys, AWS credentials, JWT secrets. If Gitleaks finds a hit, the push is blocked and Slack gets an alert immediately.
+
+**Secrets in Jenkins:** All credentials (AWS keys, SonarQube tokens, GitHub deploy keys) stored in Jenkins Credentials Store. Accessed via `withCredentials` or `withAWS` blocks — never hardcoded in Jenkinsfiles. Jenkinsfiles themselves are in the application repo under `Jenkinsfile` — version controlled, reviewed in PRs.
+
+**Real scenario:** During a feature branch build, Trivy found a `CRITICAL` CVE in `log4j-core:2.14.0` — this was log4shell. The pipeline failed, blocked the merge. The dev updated the dependency to `2.17.1` (fixed version), pipeline went green. Without the scan, that code would have shipped to prod in 20 minutes. That one pipeline failure prevented a potential RCE vulnerability in production.
 
 > **Also asked as:** "What is GitOps and how do you implement it?" — GitOps = Git as the single source of truth for infrastructure and app deployment. ArgoCD watches Git repos and ensures cluster state matches. See above for the full Jenkins + ArgoCD implementation.
 
