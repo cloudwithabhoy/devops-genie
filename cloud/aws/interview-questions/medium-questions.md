@@ -1301,3 +1301,105 @@ hooks:
 
 > **Also asked as:** "How to autoscale in EC2?" — covered in Q10 (Auto Scaling Groups with target tracking, step scaling, and scheduled scaling).
 
+---
+
+## 13. Tell me about the VPC structure setup in your project.
+
+> **Also asked as:** "Walk me through your VPC architecture" · "How did you design the network in your project?"
+
+This is a project-specific question — the interviewer wants to see that you've actually designed or worked with a real VPC, not just read the docs. Answer in first person with your actual decisions and why.
+
+**The structure we used (3-tier VPC, multi-AZ, production-grade):**
+
+```
+Region: ap-south-1 (Mumbai)
+VPC CIDR: 10.0.0.0/16
+
+Availability Zones: ap-south-1a, ap-south-1b, ap-south-1c
+
+Public Subnets (10.0.0.0/20 per AZ):
+  ap-south-1a: 10.0.0.0/20    ← ALB, NAT Gateway, Bastion
+  ap-south-1b: 10.0.16.0/20
+  ap-south-1c: 10.0.32.0/20
+
+Private App Subnets (10.0.48.0/20 per AZ):
+  ap-south-1a: 10.0.48.0/20   ← EKS worker nodes, EC2 app servers
+  ap-south-1b: 10.0.64.0/20
+  ap-south-1c: 10.0.80.0/20
+
+Private DB Subnets (10.0.96.0/20 per AZ):
+  ap-south-1a: 10.0.96.0/20   ← RDS, ElastiCache (no outbound to internet)
+  ap-south-1b: 10.0.112.0/20
+  ap-south-1c: 10.0.128.0/20
+```
+
+**Traffic flow:**
+
+```
+Internet
+    ↓
+Internet Gateway
+    ↓
+ALB (Public Subnet)  ← Security Group: allow 443 from 0.0.0.0/0
+    ↓
+EKS Pods / EC2 (Private App Subnet)  ← SG: allow 8080 from ALB SG only
+    ↓
+RDS PostgreSQL (Private DB Subnet)  ← SG: allow 5432 from App SG only
+
+Outbound internet (for OS updates, Docker pulls):
+EKS Worker Node → NAT Gateway (Public Subnet) → Internet Gateway → Internet
+```
+
+**Key design decisions and why:**
+
+**1. Three tiers of subnets:**
+We separated public, app, and DB subnets for blast radius. If the app tier is compromised, the attacker can't directly reach the DB — Security Groups layer enforce this. The DB subnets have no route to the internet at all (no NAT Gateway route in the DB subnet route table).
+
+**2. One NAT Gateway per AZ:**
+Early on, we had a single NAT Gateway in `ap-south-1a`. During a brief AZ disruption, nodes in 1b and 1c couldn't pull images or reach external APIs. Lesson: NAT Gateways are AZ-scoped. We now deploy one per AZ — costs ~$100/month more but eliminates cross-AZ dependency.
+
+**3. Security Groups over NACLs:**
+We use Security Groups as the primary network control — they're stateful and attached to ENIs, so rules are more precise. NACLs are stateless and subnet-level — we use them only as a coarse last-resort deny (block known bad IP ranges at the NACL level).
+
+**4. VPC Flow Logs enabled:**
+All traffic logged to S3 and queried with Athena. When we had an unexplained connection timeout, Flow Logs showed the ACCEPT/REJECT decision for each packet — traced the issue to a missing SG rule in under 5 minutes.
+
+**5. VPC Peering / Transit Gateway:**
+We had 3 separate VPCs: prod, staging, and a shared-services VPC (Jenkins, monitoring). Connected them via AWS Transit Gateway. Peering would have required N*(N-1)/2 connections; TGW gives us a hub-and-spoke model with centralized route control.
+
+**Terraform snippet (how we provisioned it):**
+
+```hcl
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "5.0.0"
+
+  name = "prod-vpc"
+  cidr = "10.0.0.0/16"
+
+  azs             = ["ap-south-1a", "ap-south-1b", "ap-south-1c"]
+  public_subnets  = ["10.0.0.0/20",  "10.0.16.0/20", "10.0.32.0/20"]
+  private_subnets = ["10.0.48.0/20", "10.0.64.0/20", "10.0.80.0/20"]
+  database_subnets = ["10.0.96.0/20","10.0.112.0/20","10.0.128.0/20"]
+
+  enable_nat_gateway     = true
+  single_nat_gateway     = false   # One per AZ
+  one_nat_gateway_per_az = true
+
+  enable_vpn_gateway = false
+  enable_flow_log    = true
+  flow_log_destination_type = "s3"
+  flow_log_destination_arn  = aws_s3_bucket.flow_logs.arn
+
+  tags = {
+    Environment = "production"
+    Terraform   = "true"
+  }
+}
+```
+
+**Common follow-up questions interviewers ask after this:**
+- "What's the difference between a Security Group and a NACL?" → SGs are stateful/instance-level; NACLs are stateless/subnet-level
+- "How does your EKS connect to RDS?" → Pod → RDS service endpoint (in DB subnet) via SG rule allowing 5432 from the EKS node SG
+- "How do you restrict SSH access?" → Bastion host in public subnet, SG allows 22 from corporate IP only. All other instances: no SG rule for port 22
+
